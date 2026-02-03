@@ -1,0 +1,1906 @@
+#!/usr/bin/env python3
+"""
+Traffic Signal Simulator - A comprehensive traffic simulation system
+with visual demonstration of traffic interactions and signal timing optimization.
+
+Research-based defaults from transportation engineering studies.
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import math
+import random
+import json
+import time
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple, Set
+from enum import Enum, auto
+from collections import defaultdict
+import copy
+import threading
+import urllib.request
+import urllib.parse
+
+
+# ============================================================================
+# RESEARCH-BASED DEFAULTS (Oliver's Averages)
+# Sources: FHWA, ITE Traffic Engineering Handbook, SAE studies
+# ============================================================================
+
+class TrafficDefaults:
+    """
+    Research-based traffic timing defaults.
+
+    Sources:
+    - FHWA Road Weather Management: https://ops.fhwa.dot.gov/weather/roadimpact.htm
+    - ITE Traffic Engineering Handbook
+    - SAE Technical Papers on Vehicle Acceleration
+    - FMCSA Vehicle Weight Standards
+    """
+
+    # Reaction times (seconds) - time from signal change to foot off brake
+    PERCEPTION_REACTION_TIME = 1.5  # Average driver perception-reaction time
+    REACTION_TIME_DISTRACTED = 2.5  # Distracted driver
+    REACTION_TIME_ELDERLY = 2.0     # Elderly driver adjustment
+    REACTION_TIME_NIGHT = 1.8       # Nighttime adjustment
+
+    # Startup lost time (seconds) - time for queue to start moving after green
+    STARTUP_LOST_TIME = 2.0         # First vehicle in queue
+    QUEUE_DISCHARGE_HEADWAY = 2.0   # Seconds between vehicles crossing stop line
+
+    # Acceleration rates (feet per second squared)
+    CAR_ACCELERATION = 8.0          # Passenger car: ~5.5 mph/s
+    CAR_MAX_SPEED = 35.0            # mph in urban areas
+
+    TRUCK_ACCELERATION = 2.5        # Semi-truck: ~1.7 mph/s (loaded)
+    TRUCK_MAX_SPEED = 30.0          # mph in urban areas
+
+    # Deceleration rates (comfortable)
+    CAR_DECELERATION = 11.2         # ft/s² (~0.35g comfortable)
+    TRUCK_DECELERATION = 8.0        # ft/s² (longer stopping distance)
+
+    # Stopping distances at 35 mph
+    CAR_STOPPING_DISTANCE = 136     # feet (perception + braking)
+    TRUCK_STOPPING_DISTANCE = 250   # feet (much longer due to weight)
+
+    # Weather impact multipliers on reaction time
+    WEATHER_CLEAR = 1.0
+    WEATHER_RAIN = 1.25             # 25% slower reactions
+    WEATHER_HEAVY_RAIN = 1.5        # 50% slower
+    WEATHER_SNOW = 1.75             # 75% slower
+    WEATHER_FOG = 1.4               # 40% slower (visibility)
+    WEATHER_ICE = 2.0               # Double reaction time
+
+    # Weather impact on max speed (multiplier)
+    SPEED_RAIN = 0.85               # 15% speed reduction
+    SPEED_HEAVY_RAIN = 0.75         # 25% speed reduction
+    SPEED_SNOW = 0.60               # 40% speed reduction
+    SPEED_FOG = 0.70                # 30% speed reduction
+    SPEED_ICE = 0.50                # 50% speed reduction
+
+    # Time of day impacts
+    TIME_DAY = 1.0                  # Baseline
+    TIME_NIGHT = 1.2                # 20% slower
+    TIME_RUSH_HOUR = 1.1            # 10% slower (stress/aggression)
+    TIME_LATE_NIGHT = 1.3           # 30% slower (fatigue)
+
+    # Distraction impact
+    DISTRACTION_NONE = 1.0
+    DISTRACTION_LIGHT = 1.15        # Radio, talking
+    DISTRACTION_MODERATE = 1.35     # Eating, GPS
+    DISTRACTION_HEAVY = 1.75        # Phone use
+
+    # Signal timing defaults (seconds)
+    YELLOW_LIGHT_DURATION = 4.0     # Standard yellow
+    ALL_RED_CLEARANCE = 2.0         # All-red interval
+    MIN_GREEN_TIME = 10.0           # Minimum green phase
+    MAX_GREEN_TIME = 60.0           # Maximum green phase
+    PEDESTRIAN_WALK_TIME = 7.0      # Walk signal
+    PEDESTRIAN_CLEARANCE = 15.0     # Flashing don't walk
+
+    # Pedestrian delays
+    PEDESTRIAN_CROSSING_SPEED = 3.5  # ft/s average
+    TOURIST_PEDESTRIAN_MULTIPLIER = 1.5  # Tourists walk slower, more frequent
+
+    # Vehicle lengths (feet)
+    CAR_LENGTH = 15.0
+    TRUCK_LENGTH = 70.0             # Semi with trailer
+
+    # Following distances
+    MIN_FOLLOWING_DISTANCE = 10.0   # feet (stopped)
+    FOLLOWING_TIME_GAP = 2.0        # seconds at speed
+
+
+# ============================================================================
+# ENUMS AND DATA CLASSES
+# ============================================================================
+
+class Direction(Enum):
+    NORTH = 0
+    EAST = 1
+    SOUTH = 2
+    WEST = 3
+
+class SignalState(Enum):
+    GREEN = "green"
+    YELLOW = "yellow"
+    RED = "red"
+    FLASHING_YELLOW = "flashing_yellow"
+    FLASHING_RED = "flashing_red"
+    OFF = "off"
+
+class SignalType(Enum):
+    NONE = "none"
+    TRAFFIC_LIGHT = "traffic_light"
+    STOP_SIGN = "stop_sign"
+    FOUR_WAY_STOP = "four_way_stop"
+    YIELD_SIGN = "yield_sign"
+    FLASHING_YELLOW = "flashing_yellow"
+    FLASHING_RED = "flashing_red"
+    ROUNDABOUT = "roundabout"
+    PEDESTRIAN_SIGNAL = "pedestrian_signal"
+
+class RoadType(Enum):
+    NONE = 0
+    STRAIGHT_NS = 1    # North-South
+    STRAIGHT_EW = 2    # East-West
+    INTERSECTION = 3   # 4-way intersection
+    T_NORTH = 4        # T intersection (no south exit)
+    T_SOUTH = 5
+    T_EAST = 6
+    T_WEST = 7
+    CORNER_NE = 8
+    CORNER_NW = 9
+    CORNER_SE = 10
+    CORNER_SW = 11
+
+class VehicleType(Enum):
+    CAR = "car"
+    TRUCK = "truck"
+    SEMI = "semi"
+
+class WeatherType(Enum):
+    CLEAR = "Clear"
+    RAIN = "Rain"
+    HEAVY_RAIN = "Heavy Rain"
+    SNOW = "Snow"
+    FOG = "Fog"
+    ICE = "Ice"
+
+class TimeOfDay(Enum):
+    MORNING_RUSH = "Morning Rush (7-9 AM)"
+    MIDDAY = "Midday (10 AM-3 PM)"
+    EVENING_RUSH = "Evening Rush (4-7 PM)"
+    EVENING = "Evening (7-10 PM)"
+    NIGHT = "Night (10 PM-6 AM)"
+    LATE_NIGHT = "Late Night (12-5 AM)"
+
+
+@dataclass
+class Vehicle:
+    """Represents a vehicle in the simulation."""
+    id: int
+    vehicle_type: VehicleType
+    x: float
+    y: float
+    direction: Direction
+    speed: float = 0.0
+    target_speed: float = 35.0
+    length: float = 15.0
+    width: float = 6.0
+    acceleration: float = 8.0
+    max_deceleration: float = 11.2
+    color: str = "blue"
+    waiting_time: float = 0.0
+    total_stopped_time: float = 0.0
+    distance_traveled: float = 0.0
+    is_stopped: bool = False
+    stop_start_time: float = 0.0
+
+    def __post_init__(self):
+        if self.vehicle_type == VehicleType.CAR:
+            self.length = TrafficDefaults.CAR_LENGTH
+            self.acceleration = TrafficDefaults.CAR_ACCELERATION
+            self.max_deceleration = TrafficDefaults.CAR_DECELERATION
+            self.target_speed = TrafficDefaults.CAR_MAX_SPEED
+            self.color = random.choice(["#3498db", "#2ecc71", "#9b59b6", "#e74c3c", "#f39c12", "#1abc9c"])
+        elif self.vehicle_type in (VehicleType.TRUCK, VehicleType.SEMI):
+            self.length = TrafficDefaults.TRUCK_LENGTH if self.vehicle_type == VehicleType.SEMI else 35.0
+            self.acceleration = TrafficDefaults.TRUCK_ACCELERATION
+            self.max_deceleration = TrafficDefaults.TRUCK_DECELERATION
+            self.target_speed = TrafficDefaults.TRUCK_MAX_SPEED
+            self.color = "#7f8c8d" if self.vehicle_type == VehicleType.SEMI else "#95a5a6"
+
+
+@dataclass
+class TrafficSignal:
+    """Represents a traffic signal at an intersection."""
+    signal_type: SignalType
+    states: Dict[Direction, SignalState] = field(default_factory=dict)
+    phase_time: float = 0.0
+    current_phase: int = 0
+    green_time_ns: float = 30.0
+    green_time_ew: float = 30.0
+    yellow_time: float = 4.0
+    all_red_time: float = 2.0
+    pedestrian_phase: bool = False
+    pedestrian_time_remaining: float = 0.0
+    is_tourism_area: bool = False
+    pedestrian_frequency: float = 0.1  # Probability of pedestrian per cycle
+
+    def __post_init__(self):
+        if not self.states:
+            for d in Direction:
+                self.states[d] = SignalState.RED
+
+
+@dataclass
+class GridCell:
+    """Represents a cell in the city grid."""
+    x: int
+    y: int
+    road_type: RoadType = RoadType.NONE
+    signal: Optional[TrafficSignal] = None
+    speed_limit: float = 35.0
+    is_tourism_area: bool = False
+
+
+@dataclass
+class SimulationStats:
+    """Tracks simulation statistics for comparison."""
+    name: str
+    total_vehicles: int = 0
+    total_stopped_time: float = 0.0
+    total_travel_time: float = 0.0
+    total_distance: float = 0.0
+    average_speed: float = 0.0
+    average_wait_time: float = 0.0
+    max_wait_time: float = 0.0
+    throughput: int = 0  # Vehicles that completed their route
+    timestamp: float = 0.0
+    config_snapshot: Dict = field(default_factory=dict)
+
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+
+class TrafficSimulator:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Traffic Signal Simulator - Efficiency Analysis Tool")
+        self.root.geometry("1600x900")
+
+        # Simulation state
+        self.grid_size = 8  # 8x8 grid
+        self.cell_size = 60  # pixels per cell
+        self.grid: List[List[GridCell]] = []
+        self.vehicles: List[Vehicle] = []
+        self.vehicle_id_counter = 0
+        self.simulation_running = False
+        self.simulation_speed = 1.0
+        self.sim_time = 0.0
+        self.last_update_time = 0.0
+
+        # Statistics
+        self.current_stats = SimulationStats(name="Current")
+        self.saved_simulations: List[SimulationStats] = []
+
+        # Condition modifiers
+        self.weather = WeatherType.CLEAR
+        self.time_of_day = TimeOfDay.MIDDAY
+        self.distraction_level = 0.0  # 0-1 scale
+        self.heavy_vehicle_ratio = 0.1  # 10% trucks by default
+        self.traffic_density = 0.5  # 0-1 scale
+
+        # Pedestrian settings
+        self.pedestrian_enabled = True
+        self.tourism_pedestrian_multiplier = 1.5
+
+        # Build mode
+        self.build_mode = "road"  # road, signal, delete, tourism
+        self.selected_signal_type = SignalType.TRAFFIC_LIGHT
+        self.selected_road_type = RoadType.INTERSECTION
+
+        # UI collapsed state
+        self.panel_states = {
+            "conditions": True,
+            "vehicles": True,
+            "signals": True,
+            "build": True,
+            "analytics": True
+        }
+
+        self._setup_ui()
+        self._init_grid()
+
+        # Start update loop
+        self._update_loop()
+
+    def _setup_ui(self):
+        """Setup the main UI layout."""
+        # Main container
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Left panel - Controls
+        self.control_panel = ttk.Frame(self.main_frame, width=350)
+        self.control_panel.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        self.control_panel.pack_propagate(False)
+
+        # Create scrollable control panel
+        self.control_canvas = tk.Canvas(self.control_panel)
+        self.control_scrollbar = ttk.Scrollbar(self.control_panel, orient="vertical",
+                                                command=self.control_canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.control_canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.control_canvas.configure(scrollregion=self.control_canvas.bbox("all"))
+        )
+
+        self.control_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.control_canvas.configure(yscrollcommand=self.control_scrollbar.set)
+
+        self.control_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.control_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Bind mouse wheel
+        self.control_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        self._setup_control_panels()
+
+        # Center - Canvas for simulation
+        self.canvas_frame = ttk.Frame(self.main_frame)
+        self.canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.canvas = tk.Canvas(self.canvas_frame, bg="#2c3e50")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Bind canvas events
+        self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<Button-3>", self._on_canvas_right_click)
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # Right panel - Analytics
+        self.analytics_panel = ttk.Frame(self.main_frame, width=300)
+        self.analytics_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+        self.analytics_panel.pack_propagate(False)
+
+        self._setup_analytics_panel()
+
+        # Bottom - Status bar
+        self.status_bar = ttk.Frame(self.root)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.status_label = ttk.Label(self.status_bar, text="Ready")
+        self.status_label.pack(side=tk.LEFT, padx=5)
+
+        self.time_label = ttk.Label(self.status_bar, text="Time: 0:00")
+        self.time_label.pack(side=tk.RIGHT, padx=5)
+
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling."""
+        self.control_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+    def _create_collapsible_panel(self, parent, title, key):
+        """Create a collapsible panel section."""
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+
+        # Header with toggle button
+        header = ttk.Frame(frame)
+        header.pack(fill=tk.X)
+
+        toggle_text = "[-]" if self.panel_states.get(key, True) else "[+]"
+        toggle_btn = ttk.Button(header, text=toggle_text, width=3,
+                                command=lambda: self._toggle_panel(key, content, toggle_btn))
+        toggle_btn.pack(side=tk.LEFT)
+
+        ttk.Label(header, text=title, font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+
+        # Content frame
+        content = ttk.Frame(frame)
+        if self.panel_states.get(key, True):
+            content.pack(fill=tk.X, padx=10, pady=5)
+
+        return content
+
+    def _toggle_panel(self, key, content, button):
+        """Toggle a collapsible panel."""
+        self.panel_states[key] = not self.panel_states.get(key, True)
+        if self.panel_states[key]:
+            content.pack(fill=tk.X, padx=10, pady=5)
+            button.config(text="[-]")
+        else:
+            content.pack_forget()
+            button.config(text="[+]")
+
+    def _setup_control_panels(self):
+        """Setup all control panel sections."""
+        # Simulation Controls
+        sim_frame = ttk.LabelFrame(self.scrollable_frame, text="Simulation")
+        sim_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        btn_frame = ttk.Frame(sim_frame)
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.start_btn = ttk.Button(btn_frame, text="Start", command=self._toggle_simulation)
+        self.start_btn.pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(btn_frame, text="Reset", command=self._reset_simulation).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Clear", command=self._clear_vehicles).pack(side=tk.LEFT, padx=2)
+
+        # Speed control
+        speed_frame = ttk.Frame(sim_frame)
+        speed_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(speed_frame, text="Speed:").pack(side=tk.LEFT)
+        self.speed_var = tk.DoubleVar(value=1.0)
+        speed_scale = ttk.Scale(speed_frame, from_=0.1, to=10.0, variable=self.speed_var,
+                                orient=tk.HORIZONTAL, command=self._update_speed)
+        speed_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.speed_label = ttk.Label(speed_frame, text="1.0x")
+        self.speed_label.pack(side=tk.LEFT)
+
+        # Weather & Conditions Panel
+        conditions_content = self._create_collapsible_panel(
+            self.scrollable_frame, "Weather & Conditions", "conditions")
+
+        # Weather dropdown
+        weather_frame = ttk.Frame(conditions_content)
+        weather_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(weather_frame, text="Weather:").pack(side=tk.LEFT)
+        self.weather_var = tk.StringVar(value=WeatherType.CLEAR.value)
+        weather_combo = ttk.Combobox(weather_frame, textvariable=self.weather_var,
+                                      values=[w.value for w in WeatherType], state="readonly")
+        weather_combo.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
+        weather_combo.bind("<<ComboboxSelected>>", self._update_weather)
+
+        # Time of day
+        time_frame = ttk.Frame(conditions_content)
+        time_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(time_frame, text="Time:").pack(side=tk.LEFT)
+        self.time_var = tk.StringVar(value=TimeOfDay.MIDDAY.value)
+        time_combo = ttk.Combobox(time_frame, textvariable=self.time_var,
+                                   values=[t.value for t in TimeOfDay], state="readonly")
+        time_combo.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
+        time_combo.bind("<<ComboboxSelected>>", self._update_time_of_day)
+
+        # Distraction slider
+        distract_frame = ttk.Frame(conditions_content)
+        distract_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(distract_frame, text="Distraction:").pack(side=tk.LEFT)
+        self.distraction_var = tk.DoubleVar(value=0.0)
+        distract_scale = ttk.Scale(distract_frame, from_=0, to=1, variable=self.distraction_var,
+                                    orient=tk.HORIZONTAL)
+        distract_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.distraction_label = ttk.Label(distract_frame, text="None")
+        self.distraction_label.pack(side=tk.RIGHT)
+        self.distraction_var.trace("w", self._update_distraction_label)
+
+        # Impact display
+        self.impact_label = ttk.Label(conditions_content,
+                                       text="Reaction modifier: 1.0x\nSpeed modifier: 1.0x",
+                                       font=("Arial", 8))
+        self.impact_label.pack(fill=tk.X, pady=5)
+
+        # Vehicle Settings Panel
+        vehicle_content = self._create_collapsible_panel(
+            self.scrollable_frame, "Vehicle Settings", "vehicles")
+
+        # Traffic density
+        density_frame = ttk.Frame(vehicle_content)
+        density_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(density_frame, text="Traffic Density:").pack(side=tk.LEFT)
+        self.density_var = tk.DoubleVar(value=0.5)
+        density_scale = ttk.Scale(density_frame, from_=0.1, to=1.0, variable=self.density_var,
+                                   orient=tk.HORIZONTAL)
+        density_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.density_label = ttk.Label(density_frame, text="50%")
+        self.density_label.pack(side=tk.RIGHT)
+        self.density_var.trace("w", self._update_density_label)
+
+        # Heavy vehicle ratio
+        truck_frame = ttk.Frame(vehicle_content)
+        truck_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(truck_frame, text="Heavy Vehicles:").pack(side=tk.LEFT)
+        self.truck_var = tk.DoubleVar(value=0.1)
+        truck_scale = ttk.Scale(truck_frame, from_=0, to=0.5, variable=self.truck_var,
+                                 orient=tk.HORIZONTAL)
+        truck_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.truck_label = ttk.Label(truck_frame, text="10%")
+        self.truck_label.pack(side=tk.RIGHT)
+        self.truck_var.trace("w", self._update_truck_label)
+
+        # Pedestrian settings
+        ped_frame = ttk.Frame(vehicle_content)
+        ped_frame.pack(fill=tk.X, pady=2)
+        self.ped_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ped_frame, text="Enable Pedestrians",
+                        variable=self.ped_var).pack(side=tk.LEFT)
+
+        tourism_frame = ttk.Frame(vehicle_content)
+        tourism_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(tourism_frame, text="Tourism Ped. Rate:").pack(side=tk.LEFT)
+        self.tourism_var = tk.DoubleVar(value=1.5)
+        tourism_scale = ttk.Scale(tourism_frame, from_=1.0, to=3.0, variable=self.tourism_var,
+                                   orient=tk.HORIZONTAL)
+        tourism_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.tourism_label = ttk.Label(tourism_frame, text="1.5x")
+        self.tourism_label.pack(side=tk.RIGHT)
+        self.tourism_var.trace("w", self._update_tourism_label)
+
+        # Signal Settings Panel
+        signal_content = self._create_collapsible_panel(
+            self.scrollable_frame, "Signal Timing", "signals")
+
+        # Green time NS
+        green_ns_frame = ttk.Frame(signal_content)
+        green_ns_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(green_ns_frame, text="Green N/S (s):").pack(side=tk.LEFT)
+        self.green_ns_var = tk.DoubleVar(value=30.0)
+        green_ns_scale = ttk.Scale(green_ns_frame, from_=10, to=120, variable=self.green_ns_var,
+                                    orient=tk.HORIZONTAL)
+        green_ns_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.green_ns_label = ttk.Label(green_ns_frame, text="30s")
+        self.green_ns_label.pack(side=tk.RIGHT)
+        self.green_ns_var.trace("w", self._update_green_ns_label)
+
+        # Green time EW
+        green_ew_frame = ttk.Frame(signal_content)
+        green_ew_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(green_ew_frame, text="Green E/W (s):").pack(side=tk.LEFT)
+        self.green_ew_var = tk.DoubleVar(value=30.0)
+        green_ew_scale = ttk.Scale(green_ew_frame, from_=10, to=120, variable=self.green_ew_var,
+                                    orient=tk.HORIZONTAL)
+        green_ew_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.green_ew_label = ttk.Label(green_ew_frame, text="30s")
+        self.green_ew_label.pack(side=tk.RIGHT)
+        self.green_ew_var.trace("w", self._update_green_ew_label)
+
+        # Yellow time
+        yellow_frame = ttk.Frame(signal_content)
+        yellow_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(yellow_frame, text="Yellow (s):").pack(side=tk.LEFT)
+        self.yellow_var = tk.DoubleVar(value=4.0)
+        yellow_scale = ttk.Scale(yellow_frame, from_=2, to=8, variable=self.yellow_var,
+                                  orient=tk.HORIZONTAL)
+        yellow_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.yellow_label = ttk.Label(yellow_frame, text="4s")
+        self.yellow_label.pack(side=tk.RIGHT)
+        self.yellow_var.trace("w", self._update_yellow_label)
+
+        # All red time
+        red_frame = ttk.Frame(signal_content)
+        red_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(red_frame, text="All-Red (s):").pack(side=tk.LEFT)
+        self.all_red_var = tk.DoubleVar(value=2.0)
+        red_scale = ttk.Scale(red_frame, from_=1, to=5, variable=self.all_red_var,
+                               orient=tk.HORIZONTAL)
+        red_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.red_label = ttk.Label(red_frame, text="2s")
+        self.red_label.pack(side=tk.RIGHT)
+        self.all_red_var.trace("w", self._update_red_label)
+
+        # Apply to all signals button
+        ttk.Button(signal_content, text="Apply to All Signals",
+                   command=self._apply_signal_timing).pack(fill=tk.X, pady=5)
+
+        # Build Mode Panel
+        build_content = self._create_collapsible_panel(
+            self.scrollable_frame, "Build Tools", "build")
+
+        # Build mode buttons
+        mode_frame = ttk.Frame(build_content)
+        mode_frame.pack(fill=tk.X, pady=2)
+
+        self.build_mode_var = tk.StringVar(value="road")
+        modes = [("Road", "road"), ("Signal", "signal"), ("Tourism", "tourism"), ("Delete", "delete")]
+        for text, mode in modes:
+            ttk.Radiobutton(mode_frame, text=text, variable=self.build_mode_var,
+                           value=mode, command=self._update_build_mode).pack(side=tk.LEFT, padx=2)
+
+        # Road type selector
+        road_frame = ttk.LabelFrame(build_content, text="Road Type")
+        road_frame.pack(fill=tk.X, pady=5)
+
+        self.road_type_var = tk.StringVar(value="INTERSECTION")
+        road_types = [
+            ("4-Way", "INTERSECTION"),
+            ("N-S Road", "STRAIGHT_NS"),
+            ("E-W Road", "STRAIGHT_EW"),
+            ("T-North", "T_NORTH"),
+            ("T-South", "T_SOUTH"),
+            ("T-East", "T_EAST"),
+            ("T-West", "T_WEST"),
+        ]
+
+        for i, (text, rtype) in enumerate(road_types):
+            ttk.Radiobutton(road_frame, text=text, variable=self.road_type_var,
+                           value=rtype).grid(row=i//2, column=i%2, sticky="w", padx=5)
+
+        # Signal type selector
+        signal_frame = ttk.LabelFrame(build_content, text="Signal Type")
+        signal_frame.pack(fill=tk.X, pady=5)
+
+        self.signal_type_var = tk.StringVar(value="TRAFFIC_LIGHT")
+        signal_types = [
+            ("Traffic Light", "TRAFFIC_LIGHT"),
+            ("Stop Sign", "STOP_SIGN"),
+            ("4-Way Stop", "FOUR_WAY_STOP"),
+            ("Yield", "YIELD_SIGN"),
+            ("Flash Yellow", "FLASHING_YELLOW"),
+            ("Flash Red", "FLASHING_RED"),
+            ("Roundabout", "ROUNDABOUT"),
+            ("Ped Signal", "PEDESTRIAN_SIGNAL"),
+        ]
+
+        for i, (text, stype) in enumerate(signal_types):
+            ttk.Radiobutton(signal_frame, text=text, variable=self.signal_type_var,
+                           value=stype).grid(row=i//2, column=i%2, sticky="w", padx=5)
+
+        # Generation buttons
+        gen_frame = ttk.LabelFrame(build_content, text="Generation")
+        gen_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(gen_frame, text="Random City Grid",
+                   command=self._generate_random_city).pack(fill=tk.X, padx=5, pady=2)
+        ttk.Button(gen_frame, text="Clear Grid",
+                   command=self._clear_grid).pack(fill=tk.X, padx=5, pady=2)
+
+        # Import/Export
+        io_frame = ttk.Frame(gen_frame)
+        io_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Button(io_frame, text="Save Layout",
+                   command=self._save_layout).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(io_frame, text="Load Layout",
+                   command=self._load_layout).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+
+        ttk.Button(gen_frame, text="Import from OpenStreetMap",
+                   command=self._import_osm).pack(fill=tk.X, padx=5, pady=2)
+
+    def _setup_analytics_panel(self):
+        """Setup the analytics and comparison panel."""
+        ttk.Label(self.analytics_panel, text="Analytics & Comparison",
+                  font=("Arial", 12, "bold")).pack(pady=5)
+
+        # Current stats
+        stats_frame = ttk.LabelFrame(self.analytics_panel, text="Current Simulation")
+        stats_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.stats_labels = {}
+        stats = [
+            ("vehicles", "Active Vehicles: 0"),
+            ("throughput", "Completed: 0"),
+            ("avg_wait", "Avg Wait: 0.0s"),
+            ("max_wait", "Max Wait: 0.0s"),
+            ("total_stopped", "Total Stopped: 0.0s"),
+            ("avg_speed", "Avg Speed: 0.0 mph"),
+            ("efficiency", "Efficiency: 0%"),
+        ]
+
+        for key, text in stats:
+            label = ttk.Label(stats_frame, text=text)
+            label.pack(anchor="w", padx=5, pady=1)
+            self.stats_labels[key] = label
+
+        # Save current simulation
+        ttk.Button(stats_frame, text="Save Snapshot for Comparison",
+                   command=self._save_simulation_snapshot).pack(fill=tk.X, padx=5, pady=5)
+
+        # Comparison section
+        compare_frame = ttk.LabelFrame(self.analytics_panel, text="Comparison")
+        compare_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Saved simulations list
+        self.comparison_listbox = tk.Listbox(compare_frame, height=6)
+        self.comparison_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.comparison_listbox.bind("<<ListboxSelect>>", self._show_comparison_details)
+
+        # Comparison details
+        self.comparison_text = tk.Text(compare_frame, height=10, width=30, font=("Courier", 9))
+        self.comparison_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        btn_frame = ttk.Frame(compare_frame)
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(btn_frame, text="Compare All",
+                   command=self._compare_all_simulations).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Delete Selected",
+                   command=self._delete_selected_comparison).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Export CSV",
+                   command=self._export_comparison_csv).pack(side=tk.LEFT, padx=2)
+
+    def _init_grid(self):
+        """Initialize the city grid."""
+        self.grid = []
+        for y in range(self.grid_size):
+            row = []
+            for x in range(self.grid_size):
+                row.append(GridCell(x=x, y=y))
+            self.grid.append(row)
+
+    def _draw_grid(self):
+        """Draw the city grid on the canvas."""
+        self.canvas.delete("all")
+
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        # Calculate cell size based on canvas size
+        self.cell_size = min(canvas_width, canvas_height) // (self.grid_size + 2)
+
+        # Calculate offset to center grid
+        offset_x = (canvas_width - self.cell_size * self.grid_size) // 2
+        offset_y = (canvas_height - self.cell_size * self.grid_size) // 2
+
+        # Draw background (buildings/blocks)
+        for y in range(self.grid_size):
+            for x in range(self.grid_size):
+                cell = self.grid[y][x]
+                x1 = offset_x + x * self.cell_size
+                y1 = offset_y + y * self.cell_size
+                x2 = x1 + self.cell_size
+                y2 = y1 + self.cell_size
+
+                if cell.road_type == RoadType.NONE:
+                    # Building block
+                    color = "#95a5a6" if not cell.is_tourism_area else "#e8daef"
+                    self.canvas.create_rectangle(x1+2, y1+2, x2-2, y2-2,
+                                                  fill=color, outline="#7f8c8d")
+                else:
+                    # Road
+                    self._draw_road_cell(cell, x1, y1, x2, y2)
+
+        # Draw vehicles
+        for vehicle in self.vehicles:
+            self._draw_vehicle(vehicle, offset_x, offset_y)
+
+        # Store offset for click handling
+        self.grid_offset = (offset_x, offset_y)
+
+    def _draw_road_cell(self, cell: GridCell, x1, y1, x2, y2):
+        """Draw a road cell with appropriate markings."""
+        # Road surface
+        base_color = "#34495e"
+        if cell.is_tourism_area:
+            base_color = "#5d6d7e"
+
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill=base_color, outline="")
+
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+
+        road_type = cell.road_type
+
+        # Draw road markings based on type
+        if road_type == RoadType.STRAIGHT_NS:
+            # Yellow center line
+            self.canvas.create_line(cx, y1, cx, y2, fill="#f1c40f", width=2)
+            # White edge lines
+            self.canvas.create_line(x1+5, y1, x1+5, y2, fill="white", width=1, dash=(5,5))
+            self.canvas.create_line(x2-5, y1, x2-5, y2, fill="white", width=1, dash=(5,5))
+
+        elif road_type == RoadType.STRAIGHT_EW:
+            self.canvas.create_line(x1, cy, x2, cy, fill="#f1c40f", width=2)
+            self.canvas.create_line(x1, y1+5, x2, y1+5, fill="white", width=1, dash=(5,5))
+            self.canvas.create_line(x1, y2-5, x2, y2-5, fill="white", width=1, dash=(5,5))
+
+        elif road_type == RoadType.INTERSECTION:
+            # Crosswalk markings
+            stripe_width = 3
+            stripe_gap = 4
+            for i in range(-3, 4):
+                # North crosswalk
+                self.canvas.create_rectangle(cx + i*(stripe_width+stripe_gap), y1+2,
+                                             cx + i*(stripe_width+stripe_gap) + stripe_width, y1+10,
+                                             fill="white", outline="")
+                # South crosswalk
+                self.canvas.create_rectangle(cx + i*(stripe_width+stripe_gap), y2-10,
+                                             cx + i*(stripe_width+stripe_gap) + stripe_width, y2-2,
+                                             fill="white", outline="")
+                # East crosswalk
+                self.canvas.create_rectangle(x2-10, cy + i*(stripe_width+stripe_gap),
+                                             x2-2, cy + i*(stripe_width+stripe_gap) + stripe_width,
+                                             fill="white", outline="")
+                # West crosswalk
+                self.canvas.create_rectangle(x1+2, cy + i*(stripe_width+stripe_gap),
+                                             x1+10, cy + i*(stripe_width+stripe_gap) + stripe_width,
+                                             fill="white", outline="")
+
+        elif road_type == RoadType.ROUNDABOUT:
+            # Draw roundabout circle
+            r = self.cell_size * 0.35
+            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#2c3e50", outline="#f1c40f", width=2)
+            # Inner circle
+            r2 = r * 0.5
+            self.canvas.create_oval(cx-r2, cy-r2, cx+r2, cy+r2, fill="#27ae60", outline="#229954", width=2)
+
+        # Draw signal if present
+        if cell.signal:
+            self._draw_signal(cell.signal, cx, cy, cell.road_type)
+
+    def _draw_signal(self, signal: TrafficSignal, cx, cy, road_type):
+        """Draw traffic signal at intersection."""
+        if signal.signal_type == SignalType.TRAFFIC_LIGHT:
+            # Draw signal heads for each direction
+            positions = [
+                (cx, cy - self.cell_size*0.35, Direction.SOUTH),  # For southbound
+                (cx, cy + self.cell_size*0.35, Direction.NORTH),  # For northbound
+                (cx - self.cell_size*0.35, cy, Direction.EAST),   # For eastbound
+                (cx + self.cell_size*0.35, cy, Direction.WEST),   # For westbound
+            ]
+
+            for px, py, direction in positions:
+                state = signal.states.get(direction, SignalState.RED)
+                if state == SignalState.GREEN:
+                    color = "#2ecc71"
+                elif state == SignalState.YELLOW:
+                    color = "#f1c40f"
+                else:
+                    color = "#e74c3c"
+
+                self.canvas.create_oval(px-5, py-5, px+5, py+5, fill=color, outline="black")
+
+        elif signal.signal_type == SignalType.STOP_SIGN:
+            # Draw octagonal stop sign
+            self._draw_stop_sign(cx, cy - self.cell_size*0.3)
+
+        elif signal.signal_type == SignalType.FOUR_WAY_STOP:
+            # Draw stop signs at all corners
+            offsets = [(-0.3, -0.3), (0.3, -0.3), (-0.3, 0.3), (0.3, 0.3)]
+            for ox, oy in offsets:
+                self._draw_stop_sign(cx + self.cell_size*ox, cy + self.cell_size*oy, small=True)
+
+        elif signal.signal_type == SignalType.YIELD_SIGN:
+            # Draw yield triangle
+            self._draw_yield_sign(cx, cy - self.cell_size*0.3)
+
+        elif signal.signal_type == SignalType.FLASHING_YELLOW:
+            # Flashing yellow light
+            flash = (int(self.sim_time * 2) % 2 == 0)
+            color = "#f1c40f" if flash else "#7d6608"
+            self.canvas.create_oval(cx-8, cy-8, cx+8, cy+8, fill=color, outline="black", width=2)
+
+        elif signal.signal_type == SignalType.FLASHING_RED:
+            flash = (int(self.sim_time * 2) % 2 == 0)
+            color = "#e74c3c" if flash else "#7b241c"
+            self.canvas.create_oval(cx-8, cy-8, cx+8, cy+8, fill=color, outline="black", width=2)
+
+        elif signal.signal_type == SignalType.ROUNDABOUT:
+            pass  # Roundabout is drawn in road cell
+
+        elif signal.signal_type == SignalType.PEDESTRIAN_SIGNAL:
+            # Draw pedestrian signal
+            state = "WALK" if signal.pedestrian_phase else "WAIT"
+            color = "#2ecc71" if signal.pedestrian_phase else "#e74c3c"
+            self.canvas.create_rectangle(cx-10, cy-15, cx+10, cy+15, fill="#2c3e50", outline="white")
+            self.canvas.create_text(cx, cy, text=state[0], fill=color, font=("Arial", 10, "bold"))
+
+    def _draw_stop_sign(self, x, y, small=False):
+        """Draw an octagonal stop sign."""
+        size = 6 if small else 10
+        points = []
+        for i in range(8):
+            angle = math.pi/8 + i * math.pi/4
+            px = x + size * math.cos(angle)
+            py = y + size * math.sin(angle)
+            points.extend([px, py])
+        self.canvas.create_polygon(points, fill="#e74c3c", outline="white", width=1)
+        if not small:
+            self.canvas.create_text(x, y, text="STOP", fill="white", font=("Arial", 5, "bold"))
+
+    def _draw_yield_sign(self, x, y):
+        """Draw a yield sign (inverted triangle)."""
+        size = 10
+        points = [x, y + size, x - size, y - size/2, x + size, y - size/2]
+        self.canvas.create_polygon(points, fill="white", outline="#e74c3c", width=2)
+
+    def _draw_vehicle(self, vehicle: Vehicle, offset_x, offset_y):
+        """Draw a vehicle on the canvas."""
+        # Convert grid position to canvas position
+        px = offset_x + vehicle.x * self.cell_size
+        py = offset_y + vehicle.y * self.cell_size
+
+        # Vehicle size (scaled to cell size)
+        length = vehicle.length / 15 * self.cell_size * 0.3
+        width = vehicle.width / 6 * self.cell_size * 0.15
+
+        # Rotate based on direction
+        if vehicle.direction == Direction.NORTH:
+            x1, y1 = px - width/2, py - length/2
+            x2, y2 = px + width/2, py + length/2
+        elif vehicle.direction == Direction.SOUTH:
+            x1, y1 = px - width/2, py - length/2
+            x2, y2 = px + width/2, py + length/2
+        elif vehicle.direction == Direction.EAST:
+            x1, y1 = px - length/2, py - width/2
+            x2, y2 = px + length/2, py + width/2
+        else:  # WEST
+            x1, y1 = px - length/2, py - width/2
+            x2, y2 = px + length/2, py + width/2
+
+        # Draw vehicle body
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill=vehicle.color, outline="black")
+
+        # Draw headlights
+        if vehicle.direction == Direction.NORTH:
+            self.canvas.create_oval(x1+2, y1, x1+5, y1+3, fill="yellow")
+            self.canvas.create_oval(x2-5, y1, x2-2, y1+3, fill="yellow")
+        elif vehicle.direction == Direction.SOUTH:
+            self.canvas.create_oval(x1+2, y2-3, x1+5, y2, fill="yellow")
+            self.canvas.create_oval(x2-5, y2-3, x2-2, y2, fill="yellow")
+
+    def _on_canvas_click(self, event):
+        """Handle left click on canvas - place road/signal."""
+        if not hasattr(self, 'grid_offset'):
+            return
+
+        offset_x, offset_y = self.grid_offset
+
+        # Calculate grid cell
+        gx = int((event.x - offset_x) / self.cell_size)
+        gy = int((event.y - offset_y) / self.cell_size)
+
+        if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
+            cell = self.grid[gy][gx]
+            mode = self.build_mode_var.get()
+
+            if mode == "road":
+                road_type = RoadType[self.road_type_var.get()]
+                cell.road_type = road_type
+                # Auto-add signal for intersections
+                if road_type == RoadType.INTERSECTION:
+                    cell.signal = TrafficSignal(signal_type=SignalType.TRAFFIC_LIGHT)
+                elif road_type == RoadType.ROUNDABOUT:
+                    cell.signal = TrafficSignal(signal_type=SignalType.ROUNDABOUT)
+                else:
+                    cell.signal = None
+
+            elif mode == "signal":
+                if cell.road_type != RoadType.NONE:
+                    signal_type = SignalType[self.signal_type_var.get()]
+                    cell.signal = TrafficSignal(
+                        signal_type=signal_type,
+                        green_time_ns=self.green_ns_var.get(),
+                        green_time_ew=self.green_ew_var.get(),
+                        yellow_time=self.yellow_var.get(),
+                        all_red_time=self.all_red_var.get()
+                    )
+
+            elif mode == "tourism":
+                cell.is_tourism_area = not cell.is_tourism_area
+                if cell.signal:
+                    cell.signal.is_tourism_area = cell.is_tourism_area
+
+            elif mode == "delete":
+                cell.road_type = RoadType.NONE
+                cell.signal = None
+                cell.is_tourism_area = False
+
+            self._draw_grid()
+
+    def _on_canvas_right_click(self, event):
+        """Handle right click - show cell info/edit signal timing."""
+        if not hasattr(self, 'grid_offset'):
+            return
+
+        offset_x, offset_y = self.grid_offset
+        gx = int((event.x - offset_x) / self.cell_size)
+        gy = int((event.y - offset_y) / self.cell_size)
+
+        if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
+            cell = self.grid[gy][gx]
+            if cell.signal:
+                self._show_signal_editor(cell)
+
+    def _show_signal_editor(self, cell: GridCell):
+        """Show dialog to edit individual signal timing."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Edit Signal at ({cell.x}, {cell.y})")
+        dialog.geometry("300x400")
+        dialog.transient(self.root)
+
+        signal = cell.signal
+
+        ttk.Label(dialog, text=f"Signal Type: {signal.signal_type.value}").pack(pady=5)
+
+        # Timing controls for traffic lights
+        if signal.signal_type == SignalType.TRAFFIC_LIGHT:
+            # Green NS
+            frame = ttk.Frame(dialog)
+            frame.pack(fill=tk.X, padx=10, pady=5)
+            ttk.Label(frame, text="Green N/S (s):").pack(side=tk.LEFT)
+            ns_var = tk.DoubleVar(value=signal.green_time_ns)
+            ttk.Scale(frame, from_=10, to=120, variable=ns_var, orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            ns_label = ttk.Label(frame, text=f"{signal.green_time_ns:.0f}s")
+            ns_label.pack(side=tk.RIGHT)
+            ns_var.trace("w", lambda *args: ns_label.config(text=f"{ns_var.get():.0f}s"))
+
+            # Green EW
+            frame = ttk.Frame(dialog)
+            frame.pack(fill=tk.X, padx=10, pady=5)
+            ttk.Label(frame, text="Green E/W (s):").pack(side=tk.LEFT)
+            ew_var = tk.DoubleVar(value=signal.green_time_ew)
+            ttk.Scale(frame, from_=10, to=120, variable=ew_var, orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            ew_label = ttk.Label(frame, text=f"{signal.green_time_ew:.0f}s")
+            ew_label.pack(side=tk.RIGHT)
+            ew_var.trace("w", lambda *args: ew_label.config(text=f"{ew_var.get():.0f}s"))
+
+            # Yellow
+            frame = ttk.Frame(dialog)
+            frame.pack(fill=tk.X, padx=10, pady=5)
+            ttk.Label(frame, text="Yellow (s):").pack(side=tk.LEFT)
+            yellow_var = tk.DoubleVar(value=signal.yellow_time)
+            ttk.Scale(frame, from_=2, to=8, variable=yellow_var, orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            # All red
+            frame = ttk.Frame(dialog)
+            frame.pack(fill=tk.X, padx=10, pady=5)
+            ttk.Label(frame, text="All-Red (s):").pack(side=tk.LEFT)
+            red_var = tk.DoubleVar(value=signal.all_red_time)
+            ttk.Scale(frame, from_=1, to=5, variable=red_var, orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            def apply():
+                signal.green_time_ns = ns_var.get()
+                signal.green_time_ew = ew_var.get()
+                signal.yellow_time = yellow_var.get()
+                signal.all_red_time = red_var.get()
+                dialog.destroy()
+
+            ttk.Button(dialog, text="Apply", command=apply).pack(pady=10)
+
+        # Tourism area toggle
+        tourism_var = tk.BooleanVar(value=cell.is_tourism_area)
+        ttk.Checkbutton(dialog, text="Tourism Area (more pedestrians)",
+                        variable=tourism_var).pack(pady=5)
+
+        def save_tourism():
+            cell.is_tourism_area = tourism_var.get()
+            signal.is_tourism_area = tourism_var.get()
+
+        tourism_var.trace("w", lambda *args: save_tourism())
+
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
+
+    def _on_canvas_resize(self, event):
+        """Handle canvas resize."""
+        self._draw_grid()
+
+    # ========================================================================
+    # Simulation Logic
+    # ========================================================================
+
+    def _toggle_simulation(self):
+        """Start or stop the simulation."""
+        self.simulation_running = not self.simulation_running
+        if self.simulation_running:
+            self.start_btn.config(text="Pause")
+            self.last_update_time = time.time()
+        else:
+            self.start_btn.config(text="Start")
+
+    def _reset_simulation(self):
+        """Reset the simulation to initial state."""
+        self.simulation_running = False
+        self.start_btn.config(text="Start")
+        self.sim_time = 0.0
+        self.vehicles.clear()
+        self.current_stats = SimulationStats(name="Current")
+
+        # Reset all signals
+        for row in self.grid:
+            for cell in row:
+                if cell.signal:
+                    cell.signal.phase_time = 0.0
+                    cell.signal.current_phase = 0
+                    for d in Direction:
+                        cell.signal.states[d] = SignalState.RED
+
+        self._draw_grid()
+        self._update_stats_display()
+
+    def _clear_vehicles(self):
+        """Clear all vehicles but keep running."""
+        self.vehicles.clear()
+        self._draw_grid()
+
+    def _update_loop(self):
+        """Main simulation update loop."""
+        if self.simulation_running:
+            current_time = time.time()
+            dt = (current_time - self.last_update_time) * self.simulation_speed
+            self.last_update_time = current_time
+
+            self.sim_time += dt
+
+            # Update signals
+            self._update_signals(dt)
+
+            # Update vehicles
+            self._update_vehicles(dt)
+
+            # Spawn new vehicles
+            self._spawn_vehicles(dt)
+
+            # Update display
+            self._draw_grid()
+            self._update_stats_display()
+
+            # Update time display
+            minutes = int(self.sim_time) // 60
+            seconds = int(self.sim_time) % 60
+            self.time_label.config(text=f"Time: {minutes}:{seconds:02d}")
+
+        # Schedule next update
+        self.root.after(33, self._update_loop)  # ~30 FPS
+
+    def _update_signals(self, dt):
+        """Update all traffic signals."""
+        for row in self.grid:
+            for cell in row:
+                if cell.signal and cell.signal.signal_type == SignalType.TRAFFIC_LIGHT:
+                    self._update_traffic_light(cell.signal, dt)
+
+    def _update_traffic_light(self, signal: TrafficSignal, dt):
+        """Update a traffic light's phase."""
+        signal.phase_time += dt
+
+        # Phase timing: Green NS -> Yellow NS -> All Red -> Green EW -> Yellow EW -> All Red
+        phases = [
+            (signal.green_time_ns, {Direction.NORTH: SignalState.GREEN, Direction.SOUTH: SignalState.GREEN,
+                                     Direction.EAST: SignalState.RED, Direction.WEST: SignalState.RED}),
+            (signal.yellow_time, {Direction.NORTH: SignalState.YELLOW, Direction.SOUTH: SignalState.YELLOW,
+                                   Direction.EAST: SignalState.RED, Direction.WEST: SignalState.RED}),
+            (signal.all_red_time, {d: SignalState.RED for d in Direction}),
+            (signal.green_time_ew, {Direction.NORTH: SignalState.RED, Direction.SOUTH: SignalState.RED,
+                                     Direction.EAST: SignalState.GREEN, Direction.WEST: SignalState.GREEN}),
+            (signal.yellow_time, {Direction.NORTH: SignalState.RED, Direction.SOUTH: SignalState.RED,
+                                   Direction.EAST: SignalState.YELLOW, Direction.WEST: SignalState.YELLOW}),
+            (signal.all_red_time, {d: SignalState.RED for d in Direction}),
+        ]
+
+        # Handle pedestrian phase in tourism areas
+        if signal.is_tourism_area and self.ped_var.get():
+            # Add pedestrian delay randomly
+            if random.random() < 0.01 * self.tourism_var.get():
+                signal.pedestrian_phase = True
+                signal.pedestrian_time_remaining = TrafficDefaults.PEDESTRIAN_WALK_TIME + \
+                                                   TrafficDefaults.PEDESTRIAN_CLEARANCE
+
+        if signal.pedestrian_phase:
+            signal.pedestrian_time_remaining -= dt
+            if signal.pedestrian_time_remaining <= 0:
+                signal.pedestrian_phase = False
+            # All directions red during pedestrian phase
+            for d in Direction:
+                signal.states[d] = SignalState.RED
+            return
+
+        # Normal signal operation
+        current_phase_duration = phases[signal.current_phase][0]
+
+        if signal.phase_time >= current_phase_duration:
+            signal.phase_time = 0
+            signal.current_phase = (signal.current_phase + 1) % len(phases)
+
+        signal.states.update(phases[signal.current_phase][1])
+
+    def _get_condition_modifiers(self):
+        """Calculate condition modifiers based on weather, time, distractions."""
+        # Weather modifier
+        weather_map = {
+            WeatherType.CLEAR: (TrafficDefaults.WEATHER_CLEAR, 1.0),
+            WeatherType.RAIN: (TrafficDefaults.WEATHER_RAIN, TrafficDefaults.SPEED_RAIN),
+            WeatherType.HEAVY_RAIN: (TrafficDefaults.WEATHER_HEAVY_RAIN, TrafficDefaults.SPEED_HEAVY_RAIN),
+            WeatherType.SNOW: (TrafficDefaults.WEATHER_SNOW, TrafficDefaults.SPEED_SNOW),
+            WeatherType.FOG: (TrafficDefaults.WEATHER_FOG, TrafficDefaults.SPEED_FOG),
+            WeatherType.ICE: (TrafficDefaults.WEATHER_ICE, TrafficDefaults.SPEED_ICE),
+        }
+
+        weather = WeatherType(self.weather_var.get())
+        reaction_mod, speed_mod = weather_map.get(weather, (1.0, 1.0))
+
+        # Time of day modifier
+        time_map = {
+            TimeOfDay.MORNING_RUSH: (TrafficDefaults.TIME_RUSH_HOUR, 0.9),
+            TimeOfDay.MIDDAY: (TrafficDefaults.TIME_DAY, 1.0),
+            TimeOfDay.EVENING_RUSH: (TrafficDefaults.TIME_RUSH_HOUR, 0.9),
+            TimeOfDay.EVENING: (TrafficDefaults.TIME_DAY, 1.0),
+            TimeOfDay.NIGHT: (TrafficDefaults.TIME_NIGHT, 0.95),
+            TimeOfDay.LATE_NIGHT: (TrafficDefaults.TIME_LATE_NIGHT, 1.0),
+        }
+
+        time_of_day = TimeOfDay(self.time_var.get())
+        time_reaction, time_speed = time_map.get(time_of_day, (1.0, 1.0))
+        reaction_mod *= time_reaction
+        speed_mod *= time_speed
+
+        # Distraction modifier
+        distraction = self.distraction_var.get()
+        if distraction < 0.25:
+            distraction_mod = TrafficDefaults.DISTRACTION_NONE
+        elif distraction < 0.5:
+            distraction_mod = TrafficDefaults.DISTRACTION_LIGHT
+        elif distraction < 0.75:
+            distraction_mod = TrafficDefaults.DISTRACTION_MODERATE
+        else:
+            distraction_mod = TrafficDefaults.DISTRACTION_HEAVY
+
+        reaction_mod *= distraction_mod
+
+        return reaction_mod, speed_mod
+
+    def _update_vehicles(self, dt):
+        """Update all vehicle positions and behaviors."""
+        reaction_mod, speed_mod = self._get_condition_modifiers()
+
+        vehicles_to_remove = []
+
+        for vehicle in self.vehicles:
+            # Get cell vehicle is in
+            gx = int(vehicle.x)
+            gy = int(vehicle.y)
+
+            # Check if vehicle left the grid
+            if not (0 <= gx < self.grid_size and 0 <= gy < self.grid_size):
+                vehicles_to_remove.append(vehicle)
+                self.current_stats.throughput += 1
+                continue
+
+            cell = self.grid[gy][gx]
+
+            # Determine target speed based on conditions
+            base_target = vehicle.target_speed * speed_mod
+
+            # Check for signals
+            should_stop = False
+            if cell.signal:
+                should_stop = self._should_vehicle_stop(vehicle, cell.signal)
+
+            # Check for vehicles ahead
+            vehicle_ahead = self._get_vehicle_ahead(vehicle)
+            if vehicle_ahead:
+                # Maintain safe following distance
+                dist = self._distance_to_vehicle(vehicle, vehicle_ahead)
+                safe_dist = TrafficDefaults.MIN_FOLLOWING_DISTANCE + \
+                           vehicle.speed * TrafficDefaults.FOLLOWING_TIME_GAP * reaction_mod
+                if dist < safe_dist:
+                    should_stop = True
+                elif dist < safe_dist * 2:
+                    base_target = min(base_target, vehicle_ahead.speed * 0.9)
+
+            # Update speed
+            if should_stop:
+                # Decelerate
+                decel = vehicle.max_deceleration / reaction_mod
+                vehicle.speed = max(0, vehicle.speed - decel * dt)
+
+                if vehicle.speed == 0:
+                    if not vehicle.is_stopped:
+                        vehicle.is_stopped = True
+                        vehicle.stop_start_time = self.sim_time
+                    vehicle.waiting_time += dt
+            else:
+                # Accelerate toward target
+                accel = vehicle.acceleration / reaction_mod
+                if vehicle.speed < base_target:
+                    vehicle.speed = min(base_target, vehicle.speed + accel * dt)
+                else:
+                    vehicle.speed = max(base_target, vehicle.speed - accel * dt)
+
+                if vehicle.is_stopped:
+                    vehicle.is_stopped = False
+                    vehicle.total_stopped_time += self.sim_time - vehicle.stop_start_time
+
+            # Update position (convert mph to grid units per second)
+            # Assuming each cell is ~100 feet, 1 mph = 1.467 ft/s
+            speed_grid = vehicle.speed * 1.467 / 100  # grid cells per second
+
+            if vehicle.direction == Direction.NORTH:
+                vehicle.y -= speed_grid * dt
+            elif vehicle.direction == Direction.SOUTH:
+                vehicle.y += speed_grid * dt
+            elif vehicle.direction == Direction.EAST:
+                vehicle.x += speed_grid * dt
+            elif vehicle.direction == Direction.WEST:
+                vehicle.x -= speed_grid * dt
+
+            vehicle.distance_traveled += vehicle.speed * dt
+
+        # Remove vehicles that left grid
+        for v in vehicles_to_remove:
+            self.vehicles.remove(v)
+            self.current_stats.total_stopped_time += v.total_stopped_time
+            self.current_stats.total_distance += v.distance_traveled
+
+    def _should_vehicle_stop(self, vehicle: Vehicle, signal: TrafficSignal) -> bool:
+        """Determine if vehicle should stop for a signal."""
+        if signal.signal_type == SignalType.TRAFFIC_LIGHT:
+            state = signal.states.get(vehicle.direction, SignalState.RED)
+            if state == SignalState.RED:
+                return True
+            elif state == SignalState.YELLOW:
+                # Stop if can't clear intersection
+                return vehicle.speed < 20  # Simplified decision
+
+        elif signal.signal_type in (SignalType.STOP_SIGN, SignalType.FOUR_WAY_STOP, SignalType.FLASHING_RED):
+            # Must stop, then proceed
+            if vehicle.waiting_time < TrafficDefaults.STARTUP_LOST_TIME:
+                return True
+
+        elif signal.signal_type == SignalType.YIELD_SIGN:
+            # Yield if cross traffic
+            pass
+
+        elif signal.signal_type == SignalType.ROUNDABOUT:
+            # Yield to traffic in roundabout
+            pass
+
+        # Pedestrian phase blocks all
+        if signal.pedestrian_phase:
+            return True
+
+        return False
+
+    def _get_vehicle_ahead(self, vehicle: Vehicle) -> Optional[Vehicle]:
+        """Find the nearest vehicle ahead in the same lane."""
+        min_dist = float('inf')
+        nearest = None
+
+        for other in self.vehicles:
+            if other is vehicle:
+                continue
+            if other.direction != vehicle.direction:
+                continue
+
+            # Check if ahead
+            if vehicle.direction == Direction.NORTH and other.y < vehicle.y:
+                dist = vehicle.y - other.y
+            elif vehicle.direction == Direction.SOUTH and other.y > vehicle.y:
+                dist = other.y - vehicle.y
+            elif vehicle.direction == Direction.EAST and other.x > vehicle.x:
+                dist = other.x - vehicle.x
+            elif vehicle.direction == Direction.WEST and other.x < vehicle.x:
+                dist = vehicle.x - other.x
+            else:
+                continue
+
+            if dist < min_dist:
+                min_dist = dist
+                nearest = other
+
+        return nearest
+
+    def _distance_to_vehicle(self, v1: Vehicle, v2: Vehicle) -> float:
+        """Calculate distance between two vehicles in grid units."""
+        return math.sqrt((v1.x - v2.x)**2 + (v1.y - v2.y)**2)
+
+    def _spawn_vehicles(self, dt):
+        """Spawn new vehicles at entry points."""
+        # Find entry points (roads at grid edges)
+        density = self.density_var.get()
+        spawn_rate = density * 0.5  # vehicles per second per entry
+
+        entry_points = []
+        for y in range(self.grid_size):
+            for x in range(self.grid_size):
+                cell = self.grid[y][x]
+                if cell.road_type == RoadType.NONE:
+                    continue
+
+                # Check if at edge
+                if x == 0 and cell.road_type in (RoadType.STRAIGHT_EW, RoadType.INTERSECTION):
+                    entry_points.append((x, y, Direction.EAST))
+                if x == self.grid_size - 1 and cell.road_type in (RoadType.STRAIGHT_EW, RoadType.INTERSECTION):
+                    entry_points.append((x, y, Direction.WEST))
+                if y == 0 and cell.road_type in (RoadType.STRAIGHT_NS, RoadType.INTERSECTION):
+                    entry_points.append((x, y, Direction.SOUTH))
+                if y == self.grid_size - 1 and cell.road_type in (RoadType.STRAIGHT_NS, RoadType.INTERSECTION):
+                    entry_points.append((x, y, Direction.NORTH))
+
+        for x, y, direction in entry_points:
+            if random.random() < spawn_rate * dt:
+                # Determine vehicle type
+                truck_ratio = self.truck_var.get()
+                if random.random() < truck_ratio:
+                    vtype = random.choice([VehicleType.TRUCK, VehicleType.SEMI])
+                else:
+                    vtype = VehicleType.CAR
+
+                # Check if spawn point is clear
+                spawn_clear = True
+                for v in self.vehicles:
+                    if abs(v.x - x) < 0.5 and abs(v.y - y) < 0.5:
+                        spawn_clear = False
+                        break
+
+                if spawn_clear:
+                    self.vehicle_id_counter += 1
+                    vehicle = Vehicle(
+                        id=self.vehicle_id_counter,
+                        vehicle_type=vtype,
+                        x=float(x) + 0.5,
+                        y=float(y) + 0.5,
+                        direction=direction
+                    )
+                    self.vehicles.append(vehicle)
+                    self.current_stats.total_vehicles += 1
+
+    def _update_stats_display(self):
+        """Update the statistics display."""
+        active = len(self.vehicles)
+        self.stats_labels["vehicles"].config(text=f"Active Vehicles: {active}")
+        self.stats_labels["throughput"].config(text=f"Completed: {self.current_stats.throughput}")
+
+        if active > 0:
+            total_wait = sum(v.waiting_time for v in self.vehicles)
+            avg_wait = total_wait / active
+            max_wait = max(v.waiting_time for v in self.vehicles) if self.vehicles else 0
+            avg_speed = sum(v.speed for v in self.vehicles) / active
+
+            self.stats_labels["avg_wait"].config(text=f"Avg Wait: {avg_wait:.1f}s")
+            self.stats_labels["max_wait"].config(text=f"Max Wait: {max_wait:.1f}s")
+            self.stats_labels["avg_speed"].config(text=f"Avg Speed: {avg_speed:.1f} mph")
+            self.stats_labels["total_stopped"].config(
+                text=f"Total Stopped: {self.current_stats.total_stopped_time:.1f}s")
+
+            # Efficiency = time moving / total time
+            if self.sim_time > 0 and self.current_stats.total_vehicles > 0:
+                efficiency = 100 * (1 - total_wait / (self.sim_time * active))
+                self.stats_labels["efficiency"].config(text=f"Efficiency: {efficiency:.1f}%")
+
+        # Update impact label
+        reaction_mod, speed_mod = self._get_condition_modifiers()
+        self.impact_label.config(
+            text=f"Reaction modifier: {reaction_mod:.2f}x\nSpeed modifier: {speed_mod:.2f}x")
+
+    # ========================================================================
+    # Comparison & Analytics
+    # ========================================================================
+
+    def _save_simulation_snapshot(self):
+        """Save current simulation stats for comparison."""
+        if self.sim_time < 10:
+            messagebox.showwarning("Warning", "Run simulation for at least 10 seconds before saving.")
+            return
+
+        # Get name for snapshot
+        name = f"Sim {len(self.saved_simulations) + 1}"
+
+        # Calculate final stats
+        active = len(self.vehicles)
+        total_wait = sum(v.waiting_time for v in self.vehicles) if self.vehicles else 0
+
+        snapshot = SimulationStats(
+            name=name,
+            total_vehicles=self.current_stats.total_vehicles,
+            total_stopped_time=self.current_stats.total_stopped_time + total_wait,
+            total_travel_time=self.sim_time * active,
+            total_distance=self.current_stats.total_distance,
+            average_speed=sum(v.speed for v in self.vehicles) / active if active > 0 else 0,
+            average_wait_time=total_wait / active if active > 0 else 0,
+            max_wait_time=max(v.waiting_time for v in self.vehicles) if self.vehicles else 0,
+            throughput=self.current_stats.throughput,
+            timestamp=self.sim_time,
+            config_snapshot={
+                "weather": self.weather_var.get(),
+                "time": self.time_var.get(),
+                "distraction": self.distraction_var.get(),
+                "density": self.density_var.get(),
+                "truck_ratio": self.truck_var.get(),
+                "green_ns": self.green_ns_var.get(),
+                "green_ew": self.green_ew_var.get(),
+                "yellow": self.yellow_var.get(),
+                "all_red": self.all_red_var.get(),
+            }
+        )
+
+        self.saved_simulations.append(snapshot)
+        self.comparison_listbox.insert(tk.END, f"{name} - {self.sim_time:.0f}s")
+
+        messagebox.showinfo("Saved", f"Simulation snapshot '{name}' saved for comparison.")
+
+    def _show_comparison_details(self, event):
+        """Show details of selected simulation."""
+        selection = self.comparison_listbox.curselection()
+        if not selection:
+            return
+
+        idx = selection[0]
+        if idx < len(self.saved_simulations):
+            sim = self.saved_simulations[idx]
+
+            self.comparison_text.delete(1.0, tk.END)
+            text = f"""Simulation: {sim.name}
+Duration: {sim.timestamp:.1f}s
+========================
+Total Vehicles: {sim.total_vehicles}
+Completed: {sim.throughput}
+Avg Wait: {sim.average_wait_time:.2f}s
+Max Wait: {sim.max_wait_time:.2f}s
+Total Stopped: {sim.total_stopped_time:.1f}s
+Avg Speed: {sim.average_speed:.1f} mph
+
+Configuration:
+- Weather: {sim.config_snapshot.get('weather', 'N/A')}
+- Time: {sim.config_snapshot.get('time', 'N/A')}
+- Green N/S: {sim.config_snapshot.get('green_ns', 0):.0f}s
+- Green E/W: {sim.config_snapshot.get('green_ew', 0):.0f}s
+- Density: {sim.config_snapshot.get('density', 0)*100:.0f}%
+- Trucks: {sim.config_snapshot.get('truck_ratio', 0)*100:.0f}%
+"""
+            self.comparison_text.insert(1.0, text)
+
+    def _compare_all_simulations(self):
+        """Compare all saved simulations."""
+        if len(self.saved_simulations) < 2:
+            messagebox.showwarning("Warning", "Need at least 2 saved simulations to compare.")
+            return
+
+        # Sort by efficiency (lower avg wait = better)
+        sorted_sims = sorted(self.saved_simulations, key=lambda s: s.average_wait_time)
+
+        self.comparison_text.delete(1.0, tk.END)
+        text = "COMPARISON RESULTS\n"
+        text += "==================\n"
+        text += "Ranked by Average Wait Time:\n\n"
+
+        for i, sim in enumerate(sorted_sims, 1):
+            efficiency = 100 * sim.throughput / max(sim.total_vehicles, 1)
+            text += f"{i}. {sim.name}\n"
+            text += f"   Avg Wait: {sim.average_wait_time:.2f}s\n"
+            text += f"   Throughput: {efficiency:.1f}%\n"
+            text += f"   Total Stopped: {sim.total_stopped_time:.1f}s\n\n"
+
+        # Best configuration
+        best = sorted_sims[0]
+        text += f"\nBEST CONFIG: {best.name}\n"
+        text += f"- Green N/S: {best.config_snapshot.get('green_ns', 0):.0f}s\n"
+        text += f"- Green E/W: {best.config_snapshot.get('green_ew', 0):.0f}s\n"
+
+        self.comparison_text.insert(1.0, text)
+
+    def _delete_selected_comparison(self):
+        """Delete selected simulation from comparison."""
+        selection = self.comparison_listbox.curselection()
+        if selection:
+            idx = selection[0]
+            self.comparison_listbox.delete(idx)
+            if idx < len(self.saved_simulations):
+                del self.saved_simulations[idx]
+
+    def _export_comparison_csv(self):
+        """Export comparison data to CSV."""
+        if not self.saved_simulations:
+            messagebox.showwarning("Warning", "No simulations to export.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+
+        if filename:
+            with open(filename, 'w') as f:
+                f.write("Name,Duration,Total Vehicles,Throughput,Avg Wait,Max Wait,")
+                f.write("Total Stopped,Avg Speed,Weather,Time,Green NS,Green EW,Density,Trucks\n")
+
+                for sim in self.saved_simulations:
+                    cfg = sim.config_snapshot
+                    f.write(f"{sim.name},{sim.timestamp:.1f},{sim.total_vehicles},")
+                    f.write(f"{sim.throughput},{sim.average_wait_time:.2f},{sim.max_wait_time:.2f},")
+                    f.write(f"{sim.total_stopped_time:.1f},{sim.average_speed:.1f},")
+                    f.write(f"{cfg.get('weather', '')},{cfg.get('time', '')},")
+                    f.write(f"{cfg.get('green_ns', 0):.0f},{cfg.get('green_ew', 0):.0f},")
+                    f.write(f"{cfg.get('density', 0):.2f},{cfg.get('truck_ratio', 0):.2f}\n")
+
+            messagebox.showinfo("Exported", f"Data exported to {filename}")
+
+    # ========================================================================
+    # Build Tools
+    # ========================================================================
+
+    def _update_build_mode(self):
+        """Update the current build mode."""
+        self.build_mode = self.build_mode_var.get()
+
+    def _generate_random_city(self):
+        """Generate a random city grid layout."""
+        self._clear_grid()
+
+        # Create main roads (every 2-3 cells)
+        main_roads_x = set()
+        main_roads_y = set()
+
+        x = random.randint(1, 2)
+        while x < self.grid_size - 1:
+            main_roads_x.add(x)
+            x += random.randint(2, 3)
+
+        y = random.randint(1, 2)
+        while y < self.grid_size - 1:
+            main_roads_y.add(y)
+            y += random.randint(2, 3)
+
+        # Place roads
+        for y in range(self.grid_size):
+            for x in range(self.grid_size):
+                is_x_road = x in main_roads_x
+                is_y_road = y in main_roads_y
+
+                cell = self.grid[y][x]
+
+                if is_x_road and is_y_road:
+                    cell.road_type = RoadType.INTERSECTION
+                    # Random signal type
+                    signal_type = random.choice([
+                        SignalType.TRAFFIC_LIGHT,
+                        SignalType.TRAFFIC_LIGHT,
+                        SignalType.FOUR_WAY_STOP,
+                        SignalType.ROUNDABOUT,
+                    ])
+                    cell.signal = TrafficSignal(
+                        signal_type=signal_type,
+                        green_time_ns=self.green_ns_var.get(),
+                        green_time_ew=self.green_ew_var.get()
+                    )
+                elif is_x_road:
+                    cell.road_type = RoadType.STRAIGHT_NS
+                elif is_y_road:
+                    cell.road_type = RoadType.STRAIGHT_EW
+
+                # Random tourism areas
+                if cell.road_type != RoadType.NONE and random.random() < 0.1:
+                    cell.is_tourism_area = True
+                    if cell.signal:
+                        cell.signal.is_tourism_area = True
+
+        self._draw_grid()
+        self.status_label.config(text="Generated random city grid")
+
+    def _clear_grid(self):
+        """Clear the entire grid."""
+        for row in self.grid:
+            for cell in row:
+                cell.road_type = RoadType.NONE
+                cell.signal = None
+                cell.is_tourism_area = False
+        self._draw_grid()
+
+    def _save_layout(self):
+        """Save current layout to file."""
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+
+        if filename:
+            data = {
+                "grid_size": self.grid_size,
+                "cells": []
+            }
+
+            for row in self.grid:
+                for cell in row:
+                    if cell.road_type != RoadType.NONE:
+                        cell_data = {
+                            "x": cell.x,
+                            "y": cell.y,
+                            "road_type": cell.road_type.name,
+                            "is_tourism": cell.is_tourism_area,
+                        }
+                        if cell.signal:
+                            cell_data["signal"] = {
+                                "type": cell.signal.signal_type.name,
+                                "green_ns": cell.signal.green_time_ns,
+                                "green_ew": cell.signal.green_time_ew,
+                                "yellow": cell.signal.yellow_time,
+                                "all_red": cell.signal.all_red_time,
+                            }
+                        data["cells"].append(cell_data)
+
+            with open(filename, 'w') as f:
+                json.dump(data, f, indent=2)
+
+            messagebox.showinfo("Saved", f"Layout saved to {filename}")
+
+    def _load_layout(self):
+        """Load layout from file."""
+        filename = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+
+        if filename:
+            try:
+                with open(filename, 'r') as f:
+                    data = json.load(f)
+
+                self._clear_grid()
+
+                for cell_data in data.get("cells", []):
+                    x, y = cell_data["x"], cell_data["y"]
+                    if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
+                        cell = self.grid[y][x]
+                        cell.road_type = RoadType[cell_data["road_type"]]
+                        cell.is_tourism_area = cell_data.get("is_tourism", False)
+
+                        if "signal" in cell_data:
+                            sig_data = cell_data["signal"]
+                            cell.signal = TrafficSignal(
+                                signal_type=SignalType[sig_data["type"]],
+                                green_time_ns=sig_data.get("green_ns", 30),
+                                green_time_ew=sig_data.get("green_ew", 30),
+                                yellow_time=sig_data.get("yellow", 4),
+                                all_red_time=sig_data.get("all_red", 2),
+                                is_tourism_area=cell.is_tourism_area,
+                            )
+
+                self._draw_grid()
+                messagebox.showinfo("Loaded", "Layout loaded successfully")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load layout: {e}")
+
+    def _import_osm(self):
+        """Import road data from OpenStreetMap."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Import from OpenStreetMap")
+        dialog.geometry("400x200")
+        dialog.transient(self.root)
+
+        ttk.Label(dialog, text="Enter location name or coordinates:").pack(pady=10)
+
+        location_var = tk.StringVar(value="New York, NY")
+        entry = ttk.Entry(dialog, textvariable=location_var, width=40)
+        entry.pack(pady=5)
+
+        ttk.Label(dialog, text="Note: This will generate a simplified grid based on\n"
+                              "the general road pattern of the location.").pack(pady=10)
+
+        def do_import():
+            location = location_var.get()
+            dialog.destroy()
+            self._fetch_osm_data(location)
+
+        ttk.Button(dialog, text="Import", command=do_import).pack(pady=10)
+        ttk.Button(dialog, text="Cancel", command=dialog.destroy).pack()
+
+    def _fetch_osm_data(self, location: str):
+        """Fetch and process OSM data for location."""
+        self.status_label.config(text=f"Fetching data for {location}...")
+        self.root.update()
+
+        try:
+            # Use Nominatim to geocode
+            encoded_location = urllib.parse.quote(location)
+            url = f"https://nominatim.openstreetmap.org/search?q={encoded_location}&format=json&limit=1"
+
+            req = urllib.request.Request(url, headers={'User-Agent': 'TrafficSimulator/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+
+            if data:
+                lat = float(data[0]['lat'])
+                lon = float(data[0]['lon'])
+
+                # Generate a grid based on typical city layout
+                # (Simplified - actual OSM data parsing would require more complex processing)
+                self._generate_city_from_coords(lat, lon)
+                self.status_label.config(text=f"Generated grid inspired by {location}")
+            else:
+                messagebox.showwarning("Not Found", f"Location '{location}' not found.")
+                self.status_label.config(text="Import failed - location not found")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to fetch OSM data: {e}")
+            self.status_label.config(text="Import failed")
+
+    def _generate_city_from_coords(self, lat: float, lon: float):
+        """Generate city grid based on coordinates (simplified approach)."""
+        # Use coordinates to seed random generation for reproducibility
+        random.seed(int((lat + lon) * 10000))
+
+        self._clear_grid()
+
+        # Different cities have different grid patterns
+        # Use lat/lon to determine style
+        if abs(lat) > 40:  # Northern cities tend to have more grid-like patterns
+            spacing = 2
+        else:
+            spacing = random.randint(2, 3)
+
+        # Generate roads
+        for y in range(self.grid_size):
+            for x in range(self.grid_size):
+                is_x_road = x % spacing == 1
+                is_y_road = y % spacing == 1
+
+                cell = self.grid[y][x]
+
+                if is_x_road and is_y_road:
+                    cell.road_type = RoadType.INTERSECTION
+                    cell.signal = TrafficSignal(
+                        signal_type=SignalType.TRAFFIC_LIGHT,
+                        green_time_ns=self.green_ns_var.get(),
+                        green_time_ew=self.green_ew_var.get()
+                    )
+                elif is_x_road:
+                    cell.road_type = RoadType.STRAIGHT_NS
+                elif is_y_road:
+                    cell.road_type = RoadType.STRAIGHT_EW
+
+        random.seed()  # Reset random seed
+        self._draw_grid()
+
+    def _apply_signal_timing(self):
+        """Apply current signal timing to all signals."""
+        for row in self.grid:
+            for cell in row:
+                if cell.signal and cell.signal.signal_type == SignalType.TRAFFIC_LIGHT:
+                    cell.signal.green_time_ns = self.green_ns_var.get()
+                    cell.signal.green_time_ew = self.green_ew_var.get()
+                    cell.signal.yellow_time = self.yellow_var.get()
+                    cell.signal.all_red_time = self.all_red_var.get()
+
+        self.status_label.config(text="Applied timing to all traffic lights")
+
+    # ========================================================================
+    # UI Update Callbacks
+    # ========================================================================
+
+    def _update_speed(self, val):
+        self.simulation_speed = float(val)
+        self.speed_label.config(text=f"{self.simulation_speed:.1f}x")
+
+    def _update_weather(self, event):
+        self.weather = WeatherType(self.weather_var.get())
+
+    def _update_time_of_day(self, event):
+        self.time_of_day = TimeOfDay(self.time_var.get())
+
+    def _update_distraction_label(self, *args):
+        val = self.distraction_var.get()
+        if val < 0.25:
+            text = "None"
+        elif val < 0.5:
+            text = "Light"
+        elif val < 0.75:
+            text = "Moderate"
+        else:
+            text = "Heavy"
+        self.distraction_label.config(text=text)
+
+    def _update_density_label(self, *args):
+        self.density_label.config(text=f"{self.density_var.get()*100:.0f}%")
+
+    def _update_truck_label(self, *args):
+        self.truck_label.config(text=f"{self.truck_var.get()*100:.0f}%")
+
+    def _update_tourism_label(self, *args):
+        self.tourism_label.config(text=f"{self.tourism_var.get():.1f}x")
+
+    def _update_green_ns_label(self, *args):
+        self.green_ns_label.config(text=f"{self.green_ns_var.get():.0f}s")
+
+    def _update_green_ew_label(self, *args):
+        self.green_ew_label.config(text=f"{self.green_ew_var.get():.0f}s")
+
+    def _update_yellow_label(self, *args):
+        self.yellow_label.config(text=f"{self.yellow_var.get():.1f}s")
+
+    def _update_red_label(self, *args):
+        self.red_label.config(text=f"{self.red_var.get():.1f}s")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    root = tk.Tk()
+    app = TrafficSimulator(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

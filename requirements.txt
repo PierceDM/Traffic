@@ -1,0 +1,15 @@
+# Traffic Signal Simulator Requirements
+# Core dependencies (tkinter is built into Python)
+
+# No external dependencies required for basic operation
+# The simulator uses only Python standard library:
+# - tkinter (GUI)
+# - json (save/load)
+# - math, random (calculations)
+# - urllib (OSM import)
+# - dataclasses (data structures)
+# - enum (type definitions)
+
+# Optional: for enhanced OSM features (not required)
+# requests>=2.28.0
+# osmium>=3.5.0
