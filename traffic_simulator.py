@@ -199,6 +199,14 @@ class Vehicle:
     distance_traveled: float = 0.0
     is_stopped: bool = False
     stop_start_time: float = 0.0
+    # Individual vehicle modifiers
+    distraction_level: float = 0.0  # 0-1 scale (individual distraction)
+    reaction_modifier: float = 1.0  # Individual reaction time multiplier
+    aggression: float = 0.5  # 0=passive, 1=aggressive (affects following distance)
+    # Tracking
+    spawn_time: float = 0.0
+    stops_count: int = 0
+    intersections_passed: int = 0
 
     def __post_init__(self):
         if self.vehicle_type == VehicleType.CAR:
@@ -305,6 +313,10 @@ class TrafficSimulator:
         # Statistics
         self.current_stats = SimulationStats(name="Current")
         self.saved_simulations: List[SimulationStats] = []
+
+        # Vehicle selection
+        self.selected_vehicle: Optional[Vehicle] = None
+        self.vehicle_info_window = None
 
         # Condition modifiers
         self.weather = WeatherType.CLEAR
@@ -974,8 +986,8 @@ class TrafficSimulator:
         width = min(vehicle.width / 6, 1.0) * self.cell_size * 0.1
 
         # Ensure minimum visibility
-        length = max(length, 8)
-        width = max(width, 4)
+        length = max(length, 10)
+        width = max(width, 6)
 
         # Calculate rectangle based on direction
         if vehicle.direction == Direction.NORTH:
@@ -991,11 +1003,35 @@ class TrafficSimulator:
             x1, y1 = px - length/2, py - width/2
             x2, y2 = px + length/2, py + width/2
 
-        # Draw vehicle body with rounded corners effect
-        self.canvas.create_rectangle(x1, y1, x2, y2, fill=vehicle.color, outline="black", width=1)
+        # Store vehicle bounds for click detection
+        vehicle._canvas_bounds = (x1, y1, x2, y2)
 
-        # Draw headlights (smaller)
-        hl_size = max(2, width * 0.3)
+        # Check if this vehicle is selected
+        is_selected = (self.selected_vehicle is not None and
+                      self.selected_vehicle.id == vehicle.id)
+
+        # Draw selection highlight if selected
+        if is_selected:
+            highlight_pad = 3
+            self.canvas.create_rectangle(x1-highlight_pad, y1-highlight_pad,
+                                        x2+highlight_pad, y2+highlight_pad,
+                                        fill="", outline="#00ff00", width=2)
+
+        # Draw vehicle body
+        outline_color = "#00ff00" if is_selected else "black"
+        outline_width = 2 if is_selected else 1
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill=vehicle.color,
+                                     outline=outline_color, width=outline_width)
+
+        # Draw vehicle ID number on top
+        id_text = str(vehicle.id)
+        font_size = max(6, int(min(width, length) * 0.6))
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        self.canvas.create_text(cx, cy, text=id_text, fill="white",
+                               font=("Arial", font_size, "bold"))
+
+        # Draw headlights/taillights
+        hl_size = max(2, width * 0.25)
         if vehicle.direction == Direction.NORTH:
             self.canvas.create_oval(x1+1, y1, x1+1+hl_size, y1+hl_size, fill="#ffff00", outline="")
             self.canvas.create_oval(x2-1-hl_size, y1, x2-1, y1+hl_size, fill="#ffff00", outline="")
@@ -1010,9 +1046,22 @@ class TrafficSimulator:
             self.canvas.create_oval(x1, y2-1-hl_size, x1+hl_size, y2-1, fill="#ff0000", outline="")
 
     def _on_canvas_click(self, event):
-        """Handle left click on canvas - place road/signal."""
+        """Handle left click on canvas - select vehicle or place road/signal."""
         if not hasattr(self, 'grid_offset'):
             return
+
+        # First, check if a vehicle was clicked
+        clicked_vehicle = self._get_vehicle_at_position(event.x, event.y)
+        if clicked_vehicle:
+            self.selected_vehicle = clicked_vehicle
+            self._show_vehicle_info_window(clicked_vehicle)
+            self._draw_grid()  # Redraw to show selection
+            return
+
+        # If no vehicle clicked, deselect
+        if self.selected_vehicle:
+            self.selected_vehicle = None
+            self._draw_grid()
 
         offset_x, offset_y = self.grid_offset
 
@@ -1063,6 +1112,12 @@ class TrafficSimulator:
         if not hasattr(self, 'grid_offset'):
             return
 
+        # Check for vehicle right-click first
+        clicked_vehicle = self._get_vehicle_at_position(event.x, event.y)
+        if clicked_vehicle:
+            self._show_vehicle_properties_window(clicked_vehicle)
+            return
+
         offset_x, offset_y = self.grid_offset
         gx = int((event.x - offset_x) / self.cell_size)
         gy = int((event.y - offset_y) / self.cell_size)
@@ -1071,6 +1126,274 @@ class TrafficSimulator:
             cell = self.grid[gy][gx]
             if cell.signal:
                 self._show_signal_editor(cell)
+
+    def _get_vehicle_at_position(self, canvas_x, canvas_y) -> Optional[Vehicle]:
+        """Find a vehicle at the given canvas position."""
+        for vehicle in self.vehicles:
+            if hasattr(vehicle, '_canvas_bounds'):
+                x1, y1, x2, y2 = vehicle._canvas_bounds
+                if x1 <= canvas_x <= x2 and y1 <= canvas_y <= y2:
+                    return vehicle
+        return None
+
+    def _show_vehicle_info_window(self, vehicle: Vehicle):
+        """Show a live-updating info window for the selected vehicle."""
+        # Close existing window if open
+        if self.vehicle_info_window and self.vehicle_info_window.winfo_exists():
+            self.vehicle_info_window.destroy()
+
+        self.vehicle_info_window = tk.Toplevel(self.root)
+        self.vehicle_info_window.title(f"Vehicle #{vehicle.id} Info")
+        self.vehicle_info_window.geometry("280x400")
+        self.vehicle_info_window.transient(self.root)
+
+        # Header
+        header = ttk.Frame(self.vehicle_info_window)
+        header.pack(fill=tk.X, padx=10, pady=5)
+
+        type_text = vehicle.vehicle_type.value.upper()
+        ttk.Label(header, text=f"Vehicle #{vehicle.id} - {type_text}",
+                  font=("Arial", 12, "bold")).pack()
+
+        # Color indicator
+        color_frame = tk.Frame(header, bg=vehicle.color, width=30, height=30)
+        color_frame.pack(pady=5)
+
+        # Stats frame (will be updated)
+        stats_frame = ttk.LabelFrame(self.vehicle_info_window, text="Live Stats")
+        stats_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self._vehicle_info_labels = {}
+        stats = [
+            ("speed", "Speed: 0.0 mph"),
+            ("position", "Position: (0.0, 0.0)"),
+            ("direction", "Direction: North"),
+            ("waiting", "Waiting Time: 0.0s"),
+            ("stopped", "Total Stopped: 0.0s"),
+            ("distance", "Distance: 0.0 mi"),
+            ("stops", "Stops: 0"),
+            ("status", "Status: Moving"),
+        ]
+
+        for key, text in stats:
+            label = ttk.Label(stats_frame, text=text)
+            label.pack(anchor="w", padx=10, pady=2)
+            self._vehicle_info_labels[key] = label
+
+        # Individual settings
+        settings_frame = ttk.LabelFrame(self.vehicle_info_window, text="Individual Settings")
+        settings_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Distraction
+        dist_frame = ttk.Frame(settings_frame)
+        dist_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(dist_frame, text="Distraction:").pack(side=tk.LEFT)
+        self._veh_distract_var = tk.DoubleVar(value=vehicle.distraction_level)
+        ttk.Scale(dist_frame, from_=0, to=1, variable=self._veh_distract_var,
+                  orient=tk.HORIZONTAL, command=lambda v: self._update_vehicle_distraction(vehicle)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Reaction modifier
+        react_frame = ttk.Frame(settings_frame)
+        react_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(react_frame, text="Reaction:").pack(side=tk.LEFT)
+        self._veh_react_var = tk.DoubleVar(value=vehicle.reaction_modifier)
+        ttk.Scale(react_frame, from_=0.5, to=2.0, variable=self._veh_react_var,
+                  orient=tk.HORIZONTAL, command=lambda v: self._update_vehicle_reaction(vehicle)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Aggression
+        aggr_frame = ttk.Frame(settings_frame)
+        aggr_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(aggr_frame, text="Aggression:").pack(side=tk.LEFT)
+        self._veh_aggr_var = tk.DoubleVar(value=vehicle.aggression)
+        ttk.Scale(aggr_frame, from_=0, to=1, variable=self._veh_aggr_var,
+                  orient=tk.HORIZONTAL, command=lambda v: self._update_vehicle_aggression(vehicle)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Buttons
+        btn_frame = ttk.Frame(self.vehicle_info_window)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(btn_frame, text="Track Vehicle",
+                   command=lambda: self._track_vehicle(vehicle)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Remove Vehicle",
+                   command=lambda: self._remove_vehicle(vehicle)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Close",
+                   command=self.vehicle_info_window.destroy).pack(side=tk.RIGHT, padx=2)
+
+        # Start updating
+        self._update_vehicle_info_window(vehicle)
+
+    def _update_vehicle_info_window(self, vehicle: Vehicle):
+        """Update the vehicle info window with current stats."""
+        if not self.vehicle_info_window or not self.vehicle_info_window.winfo_exists():
+            return
+
+        if vehicle not in self.vehicles:
+            self.vehicle_info_window.destroy()
+            return
+
+        # Update labels
+        direction_names = {Direction.NORTH: "North", Direction.SOUTH: "South",
+                          Direction.EAST: "East", Direction.WEST: "West"}
+
+        self._vehicle_info_labels["speed"].config(text=f"Speed: {vehicle.speed:.1f} mph")
+        self._vehicle_info_labels["position"].config(text=f"Position: ({vehicle.x:.2f}, {vehicle.y:.2f})")
+        self._vehicle_info_labels["direction"].config(text=f"Direction: {direction_names[vehicle.direction]}")
+        self._vehicle_info_labels["waiting"].config(text=f"Waiting Time: {vehicle.waiting_time:.1f}s")
+        self._vehicle_info_labels["stopped"].config(text=f"Total Stopped: {vehicle.total_stopped_time:.1f}s")
+        self._vehicle_info_labels["distance"].config(text=f"Distance: {vehicle.distance_traveled/5280:.2f} mi")
+        self._vehicle_info_labels["stops"].config(text=f"Stops: {vehicle.stops_count}")
+
+        status = "Stopped" if vehicle.is_stopped else "Moving"
+        self._vehicle_info_labels["status"].config(text=f"Status: {status}")
+
+        # Schedule next update
+        self.vehicle_info_window.after(100, lambda: self._update_vehicle_info_window(vehicle))
+
+    def _update_vehicle_distraction(self, vehicle: Vehicle):
+        """Update vehicle distraction level."""
+        vehicle.distraction_level = self._veh_distract_var.get()
+
+    def _update_vehicle_reaction(self, vehicle: Vehicle):
+        """Update vehicle reaction modifier."""
+        vehicle.reaction_modifier = self._veh_react_var.get()
+
+    def _update_vehicle_aggression(self, vehicle: Vehicle):
+        """Update vehicle aggression level."""
+        vehicle.aggression = self._veh_aggr_var.get()
+
+    def _track_vehicle(self, vehicle: Vehicle):
+        """Keep the selected vehicle highlighted."""
+        self.selected_vehicle = vehicle
+        self._draw_grid()
+
+    def _remove_vehicle(self, vehicle: Vehicle):
+        """Remove a vehicle from the simulation."""
+        if vehicle in self.vehicles:
+            self.vehicles.remove(vehicle)
+            if self.selected_vehicle == vehicle:
+                self.selected_vehicle = None
+            if self.vehicle_info_window:
+                self.vehicle_info_window.destroy()
+            self._draw_grid()
+
+    def _show_vehicle_properties_window(self, vehicle: Vehicle):
+        """Show detailed properties window for a vehicle (right-click)."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Vehicle #{vehicle.id} Properties")
+        dialog.geometry("350x500")
+        dialog.transient(self.root)
+
+        # Type info
+        info_frame = ttk.LabelFrame(dialog, text="Vehicle Info")
+        info_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(info_frame, text=f"ID: {vehicle.id}").pack(anchor="w", padx=10)
+        ttk.Label(info_frame, text=f"Type: {vehicle.vehicle_type.value}").pack(anchor="w", padx=10)
+        ttk.Label(info_frame, text=f"Length: {vehicle.length:.1f} ft").pack(anchor="w", padx=10)
+        ttk.Label(info_frame, text=f"Width: {vehicle.width:.1f} ft").pack(anchor="w", padx=10)
+
+        # Performance
+        perf_frame = ttk.LabelFrame(dialog, text="Performance Settings")
+        perf_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Target speed
+        speed_frame = ttk.Frame(perf_frame)
+        speed_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(speed_frame, text="Target Speed (mph):").pack(side=tk.LEFT)
+        speed_var = tk.DoubleVar(value=vehicle.target_speed)
+        speed_scale = ttk.Scale(speed_frame, from_=15, to=55, variable=speed_var, orient=tk.HORIZONTAL)
+        speed_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        speed_label = ttk.Label(speed_frame, text=f"{vehicle.target_speed:.0f}")
+        speed_label.pack(side=tk.RIGHT)
+        speed_var.trace("w", lambda *args: (setattr(vehicle, 'target_speed', speed_var.get()),
+                                             speed_label.config(text=f"{speed_var.get():.0f}")))
+
+        # Acceleration
+        accel_frame = ttk.Frame(perf_frame)
+        accel_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(accel_frame, text="Acceleration (ft/s²):").pack(side=tk.LEFT)
+        accel_var = tk.DoubleVar(value=vehicle.acceleration)
+        accel_scale = ttk.Scale(accel_frame, from_=2, to=15, variable=accel_var, orient=tk.HORIZONTAL)
+        accel_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        accel_label = ttk.Label(accel_frame, text=f"{vehicle.acceleration:.1f}")
+        accel_label.pack(side=tk.RIGHT)
+        accel_var.trace("w", lambda *args: (setattr(vehicle, 'acceleration', accel_var.get()),
+                                             accel_label.config(text=f"{accel_var.get():.1f}")))
+
+        # Deceleration
+        decel_frame = ttk.Frame(perf_frame)
+        decel_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(decel_frame, text="Max Deceleration:").pack(side=tk.LEFT)
+        decel_var = tk.DoubleVar(value=vehicle.max_deceleration)
+        decel_scale = ttk.Scale(decel_frame, from_=5, to=20, variable=decel_var, orient=tk.HORIZONTAL)
+        decel_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        decel_label = ttk.Label(decel_frame, text=f"{vehicle.max_deceleration:.1f}")
+        decel_label.pack(side=tk.RIGHT)
+        decel_var.trace("w", lambda *args: (setattr(vehicle, 'max_deceleration', decel_var.get()),
+                                             decel_label.config(text=f"{decel_var.get():.1f}")))
+
+        # Behavior
+        behav_frame = ttk.LabelFrame(dialog, text="Behavior Settings")
+        behav_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Distraction
+        dist_frame = ttk.Frame(behav_frame)
+        dist_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(dist_frame, text="Distraction Level:").pack(side=tk.LEFT)
+        dist_var = tk.DoubleVar(value=vehicle.distraction_level)
+        dist_scale = ttk.Scale(dist_frame, from_=0, to=1, variable=dist_var, orient=tk.HORIZONTAL)
+        dist_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        dist_label = ttk.Label(dist_frame, text=f"{vehicle.distraction_level:.0%}")
+        dist_label.pack(side=tk.RIGHT)
+        dist_var.trace("w", lambda *args: (setattr(vehicle, 'distraction_level', dist_var.get()),
+                                            dist_label.config(text=f"{dist_var.get():.0%}")))
+
+        # Reaction
+        react_frame = ttk.Frame(behav_frame)
+        react_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(react_frame, text="Reaction Modifier:").pack(side=tk.LEFT)
+        react_var = tk.DoubleVar(value=vehicle.reaction_modifier)
+        react_scale = ttk.Scale(react_frame, from_=0.5, to=2.0, variable=react_var, orient=tk.HORIZONTAL)
+        react_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        react_label = ttk.Label(react_frame, text=f"{vehicle.reaction_modifier:.2f}x")
+        react_label.pack(side=tk.RIGHT)
+        react_var.trace("w", lambda *args: (setattr(vehicle, 'reaction_modifier', react_var.get()),
+                                             react_label.config(text=f"{react_var.get():.2f}x")))
+
+        # Aggression
+        aggr_frame = ttk.Frame(behav_frame)
+        aggr_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(aggr_frame, text="Aggression:").pack(side=tk.LEFT)
+        aggr_var = tk.DoubleVar(value=vehicle.aggression)
+        aggr_scale = ttk.Scale(aggr_frame, from_=0, to=1, variable=aggr_var, orient=tk.HORIZONTAL)
+        aggr_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        aggr_label = ttk.Label(aggr_frame, text=f"{vehicle.aggression:.0%}")
+        aggr_label.pack(side=tk.RIGHT)
+        aggr_var.trace("w", lambda *args: (setattr(vehicle, 'aggression', aggr_var.get()),
+                                            aggr_label.config(text=f"{aggr_var.get():.0%}")))
+
+        # Color picker
+        color_frame = ttk.LabelFrame(dialog, text="Appearance")
+        color_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        colors = ["#3498db", "#2ecc71", "#9b59b6", "#e74c3c", "#f39c12",
+                  "#1abc9c", "#7f8c8d", "#95a5a6", "#e67e22", "#8e44ad"]
+
+        color_btn_frame = ttk.Frame(color_frame)
+        color_btn_frame.pack(pady=5)
+
+        for i, color in enumerate(colors):
+            btn = tk.Button(color_btn_frame, bg=color, width=2, height=1,
+                           command=lambda c=color: self._set_vehicle_color(vehicle, c))
+            btn.grid(row=0, column=i, padx=2)
+
+        # Close button
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
+
+    def _set_vehicle_color(self, vehicle: Vehicle, color: str):
+        """Set vehicle color."""
+        vehicle.color = color
+        self._draw_grid()
 
     def _show_signal_editor(self, cell: GridCell):
         """Show dialog to edit individual signal timing."""
@@ -1311,11 +1634,15 @@ class TrafficSimulator:
 
     def _update_vehicles(self, dt):
         """Update all vehicle positions and behaviors."""
-        reaction_mod, speed_mod = self._get_condition_modifiers()
+        global_reaction_mod, speed_mod = self._get_condition_modifiers()
 
         vehicles_to_remove = []
 
         for vehicle in self.vehicles:
+            # Calculate individual reaction modifier
+            individual_distraction = 1.0 + vehicle.distraction_level * 0.75
+            reaction_mod = global_reaction_mod * vehicle.reaction_modifier * individual_distraction
+
             # Get cell vehicle is in
             gx = int(vehicle.x)
             gy = int(vehicle.y)
@@ -1339,10 +1666,11 @@ class TrafficSimulator:
             # Check for vehicles ahead
             vehicle_ahead = self._get_vehicle_ahead(vehicle)
             if vehicle_ahead:
-                # Maintain safe following distance
+                # Maintain safe following distance (reduced by aggression)
                 dist = self._distance_to_vehicle(vehicle, vehicle_ahead)
-                safe_dist = TrafficDefaults.MIN_FOLLOWING_DISTANCE + \
-                           vehicle.speed * TrafficDefaults.FOLLOWING_TIME_GAP * reaction_mod
+                aggression_factor = 1.0 - (vehicle.aggression * 0.4)  # Aggressive = 0.6x distance
+                safe_dist = (TrafficDefaults.MIN_FOLLOWING_DISTANCE + \
+                           vehicle.speed * TrafficDefaults.FOLLOWING_TIME_GAP * reaction_mod) * aggression_factor
                 if dist < safe_dist:
                     should_stop = True
                 elif dist < safe_dist * 2:
@@ -1358,6 +1686,7 @@ class TrafficSimulator:
                     if not vehicle.is_stopped:
                         vehicle.is_stopped = True
                         vehicle.stop_start_time = self.sim_time
+                        vehicle.stops_count += 1
                     vehicle.waiting_time += dt
             else:
                 # Accelerate toward target
@@ -1394,29 +1723,57 @@ class TrafficSimulator:
 
     def _should_vehicle_stop(self, vehicle: Vehicle, signal: TrafficSignal) -> bool:
         """Determine if vehicle should stop for a signal."""
+        # Get vehicle's position within the cell
+        cell_x = vehicle.x - int(vehicle.x)
+        cell_y = vehicle.y - int(vehicle.y)
+
+        # Determine if vehicle is approaching or in the intersection
+        # Stop lines are at about 0.4 from edge
+        stop_line_threshold = 0.4
+        in_intersection = (0.3 < cell_x < 0.7 and 0.3 < cell_y < 0.7)
+
+        # If already in intersection, don't stop (keep moving to clear)
+        if in_intersection and vehicle.speed > 5:
+            return False
+
+        # Check if approaching stop line
+        approaching_stop = False
+        if vehicle.direction == Direction.NORTH:
+            approaching_stop = cell_y > (1 - stop_line_threshold) and cell_y < 0.9
+        elif vehicle.direction == Direction.SOUTH:
+            approaching_stop = cell_y < stop_line_threshold and cell_y > 0.1
+        elif vehicle.direction == Direction.EAST:
+            approaching_stop = cell_x < stop_line_threshold and cell_x > 0.1
+        elif vehicle.direction == Direction.WEST:
+            approaching_stop = cell_x > (1 - stop_line_threshold) and cell_x < 0.9
+
         if signal.signal_type == SignalType.TRAFFIC_LIGHT:
             state = signal.states.get(vehicle.direction, SignalState.RED)
             if state == SignalState.RED:
-                return True
+                # Only stop if approaching, not if already past
+                if approaching_stop or (not in_intersection and vehicle.speed < 5):
+                    return True
             elif state == SignalState.YELLOW:
-                # Stop if can't clear intersection
-                return vehicle.speed < 20  # Simplified decision
+                # Stop if can't clear intersection safely
+                time_to_clear = 0.5 / max(vehicle.speed * 1.467 / 100, 0.1)
+                if time_to_clear > signal.yellow_time * 0.5 and approaching_stop:
+                    return True
 
         elif signal.signal_type in (SignalType.STOP_SIGN, SignalType.FOUR_WAY_STOP, SignalType.FLASHING_RED):
-            # Must stop, then proceed
-            if vehicle.waiting_time < TrafficDefaults.STARTUP_LOST_TIME:
+            # Must stop briefly, then proceed
+            if approaching_stop and vehicle.waiting_time < TrafficDefaults.STARTUP_LOST_TIME:
                 return True
 
         elif signal.signal_type == SignalType.YIELD_SIGN:
-            # Yield if cross traffic
+            # Yield if cross traffic present
             pass
 
         elif signal.signal_type == SignalType.ROUNDABOUT:
             # Yield to traffic in roundabout
             pass
 
-        # Pedestrian phase blocks all
-        if signal.pedestrian_phase:
+        # Pedestrian phase blocks all at stop line
+        if signal.pedestrian_phase and approaching_stop:
             return True
 
         return False
@@ -1586,6 +1943,11 @@ class TrafficSimulator:
                         y=spawn_y,
                         direction=direction
                     )
+                    # Set individual modifiers with some randomness
+                    vehicle.spawn_time = self.sim_time
+                    vehicle.distraction_level = random.random() * self.distraction_var.get()
+                    vehicle.reaction_modifier = random.uniform(0.8, 1.2)
+                    vehicle.aggression = random.random()
                     self.vehicles.append(vehicle)
                     self.current_stats.total_vehicles += 1
 
@@ -1948,7 +2310,7 @@ Configuration:
         MapTracerWindow(self.root, self, location)
 
     def _fetch_osm_data(self, location: str):
-        """Fetch and process OSM data for location."""
+        """Fetch and process real OSM street data for location."""
         self.status_label.config(text=f"Fetching data for {location}...")
         self.root.update()
 
@@ -1965,10 +2327,16 @@ Configuration:
                 lat = float(data[0]['lat'])
                 lon = float(data[0]['lon'])
 
-                # Generate a grid based on typical city layout
-                # (Simplified - actual OSM data parsing would require more complex processing)
-                self._generate_city_from_coords(lat, lon)
-                self.status_label.config(text=f"Generated grid inspired by {location}")
+                # Try to fetch real street data from Overpass API
+                self.status_label.config(text="Fetching street network from OpenStreetMap...")
+                self.root.update()
+
+                if self._fetch_real_streets(lat, lon):
+                    self.status_label.config(text=f"Imported real streets from {location}")
+                else:
+                    # Fallback to generated grid
+                    self._generate_city_from_coords(lat, lon)
+                    self.status_label.config(text=f"Generated grid for {location}")
             else:
                 messagebox.showwarning("Not Found", f"Location '{location}' not found.")
                 self.status_label.config(text="Import failed - location not found")
@@ -1976,6 +2344,186 @@ Configuration:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to fetch OSM data: {e}")
             self.status_label.config(text="Import failed")
+
+    def _fetch_real_streets(self, lat: float, lon: float) -> bool:
+        """Fetch real street network data from Overpass API."""
+        try:
+            # Calculate bounding box (roughly 500m x 500m area)
+            # 1 degree latitude ≈ 111km, 1 degree longitude varies with latitude
+            lat_delta = 0.005  # ~500m
+            lon_delta = 0.005 / math.cos(math.radians(lat))
+
+            bbox = f"{lat - lat_delta},{lon - lon_delta},{lat + lat_delta},{lon + lon_delta}"
+
+            # Overpass query for roads and traffic signals
+            query = f"""
+            [out:json][timeout:25];
+            (
+              way["highway"~"primary|secondary|tertiary|residential|trunk"]({bbox});
+              node["highway"="traffic_signals"]({bbox});
+              node["highway"="stop"]({bbox});
+            );
+            out body;
+            >;
+            out skel qt;
+            """
+
+            overpass_url = "https://overpass-api.de/api/interpreter"
+            data = urllib.parse.urlencode({'data': query}).encode()
+
+            req = urllib.request.Request(overpass_url, data=data,
+                                         headers={'User-Agent': 'TrafficSimulator/1.0'})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                osm_data = json.loads(response.read().decode())
+
+            if 'elements' not in osm_data or len(osm_data['elements']) < 5:
+                return False
+
+            # Parse OSM data and create grid
+            self._parse_osm_to_grid(osm_data, lat, lon, lat_delta, lon_delta)
+            return True
+
+        except Exception as e:
+            print(f"Overpass API error: {e}")
+            return False
+
+    def _parse_osm_to_grid(self, osm_data: dict, center_lat: float, center_lon: float,
+                           lat_delta: float, lon_delta: float):
+        """Parse OSM data and populate the simulation grid."""
+        self._clear_grid()
+
+        # Build node lookup
+        nodes = {}
+        ways = []
+        signals = []
+        stop_signs = []
+
+        for element in osm_data.get('elements', []):
+            if element['type'] == 'node':
+                nodes[element['id']] = (element['lat'], element['lon'])
+                if element.get('tags', {}).get('highway') == 'traffic_signals':
+                    signals.append((element['lat'], element['lon']))
+                elif element.get('tags', {}).get('highway') == 'stop':
+                    stop_signs.append((element['lat'], element['lon']))
+            elif element['type'] == 'way':
+                ways.append(element)
+
+        if not ways:
+            return
+
+        # Calculate bounds for mapping to grid
+        min_lat = center_lat - lat_delta
+        max_lat = center_lat + lat_delta
+        min_lon = center_lon - lon_delta
+        max_lon = center_lon + lon_delta
+
+        def latlon_to_grid(lat, lon):
+            """Convert lat/lon to grid coordinates."""
+            gx = int((lon - min_lon) / (max_lon - min_lon) * self.grid_size)
+            gy = int((max_lat - lat) / (max_lat - min_lat) * self.grid_size)
+            gx = max(0, min(self.grid_size - 1, gx))
+            gy = max(0, min(self.grid_size - 1, gy))
+            return gx, gy
+
+        # Draw ways on grid
+        for way in ways:
+            if 'nodes' not in way:
+                continue
+
+            way_nodes = way['nodes']
+            prev_gx, prev_gy = None, None
+
+            for node_id in way_nodes:
+                if node_id not in nodes:
+                    continue
+
+                lat, lon = nodes[node_id]
+                gx, gy = latlon_to_grid(lat, lon)
+
+                # Draw line from previous point to current
+                if prev_gx is not None:
+                    self._draw_road_line(prev_gx, prev_gy, gx, gy)
+
+                prev_gx, prev_gy = gx, gy
+
+        # Add traffic signals
+        for lat, lon in signals:
+            gx, gy = latlon_to_grid(lat, lon)
+            cell = self.grid[gy][gx]
+            if cell.road_type != RoadType.NONE:
+                cell.road_type = RoadType.INTERSECTION
+                cell.signal = TrafficSignal(
+                    signal_type=SignalType.TRAFFIC_LIGHT,
+                    green_time_ns=self.green_ns_var.get(),
+                    green_time_ew=self.green_ew_var.get()
+                )
+
+        # Add stop signs
+        for lat, lon in stop_signs:
+            gx, gy = latlon_to_grid(lat, lon)
+            cell = self.grid[gy][gx]
+            if cell.road_type != RoadType.NONE and cell.signal is None:
+                cell.signal = TrafficSignal(signal_type=SignalType.STOP_SIGN)
+
+        # Find intersections (cells with roads from multiple directions)
+        for y in range(self.grid_size):
+            for x in range(self.grid_size):
+                cell = self.grid[y][x]
+                if cell.road_type == RoadType.NONE:
+                    continue
+
+                # Check neighbors
+                neighbors = 0
+                if x > 0 and self.grid[y][x-1].road_type != RoadType.NONE:
+                    neighbors += 1
+                if x < self.grid_size-1 and self.grid[y][x+1].road_type != RoadType.NONE:
+                    neighbors += 1
+                if y > 0 and self.grid[y-1][x].road_type != RoadType.NONE:
+                    neighbors += 1
+                if y < self.grid_size-1 and self.grid[y+1][x].road_type != RoadType.NONE:
+                    neighbors += 1
+
+                if neighbors >= 3 and cell.road_type != RoadType.INTERSECTION:
+                    cell.road_type = RoadType.INTERSECTION
+                    if cell.signal is None:
+                        cell.signal = TrafficSignal(
+                            signal_type=SignalType.TRAFFIC_LIGHT,
+                            green_time_ns=self.green_ns_var.get(),
+                            green_time_ew=self.green_ew_var.get()
+                        )
+
+        self._draw_grid()
+
+    def _draw_road_line(self, x1: int, y1: int, x2: int, y2: int):
+        """Draw a road line on the grid using Bresenham's algorithm."""
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx - dy
+
+        # Determine primary direction
+        is_horizontal = dx > dy
+
+        while True:
+            if 0 <= x1 < self.grid_size and 0 <= y1 < self.grid_size:
+                cell = self.grid[y1][x1]
+                if cell.road_type == RoadType.NONE:
+                    cell.road_type = RoadType.STRAIGHT_EW if is_horizontal else RoadType.STRAIGHT_NS
+                elif ((cell.road_type == RoadType.STRAIGHT_NS and is_horizontal) or
+                      (cell.road_type == RoadType.STRAIGHT_EW and not is_horizontal)):
+                    cell.road_type = RoadType.INTERSECTION
+
+            if x1 == x2 and y1 == y2:
+                break
+
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x1 += sx
+            if e2 < dx:
+                err += dx
+                y1 += sy
 
     def _generate_city_from_coords(self, lat: float, lon: float):
         """Generate city grid based on coordinates (simplified approach)."""
