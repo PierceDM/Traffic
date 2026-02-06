@@ -153,6 +153,7 @@ class RoadType(Enum):
     CORNER_NW = 9
     CORNER_SE = 10
     CORNER_SW = 11
+    ROUNDABOUT = 12    # Circular intersection
 
 class VehicleType(Enum):
     CAR = "car"
