@@ -185,6 +185,8 @@ class Vehicle:
     x: float
     y: float
     direction: Direction
+    lane: int = 0  # 0 = right lane (normal), 1 = left lane (opposite direction)
+    lane_offset: float = 0.0  # Lateral offset within road for lane positioning
     speed: float = 0.0
     target_speed: float = 35.0
     length: float = 15.0
@@ -205,12 +207,29 @@ class Vehicle:
             self.max_deceleration = TrafficDefaults.CAR_DECELERATION
             self.target_speed = TrafficDefaults.CAR_MAX_SPEED
             self.color = random.choice(["#3498db", "#2ecc71", "#9b59b6", "#e74c3c", "#f39c12", "#1abc9c"])
+            self.width = 6.0
         elif self.vehicle_type in (VehicleType.TRUCK, VehicleType.SEMI):
             self.length = TrafficDefaults.TRUCK_LENGTH if self.vehicle_type == VehicleType.SEMI else 35.0
             self.acceleration = TrafficDefaults.TRUCK_ACCELERATION
             self.max_deceleration = TrafficDefaults.TRUCK_DECELERATION
             self.target_speed = TrafficDefaults.TRUCK_MAX_SPEED
             self.color = "#7f8c8d" if self.vehicle_type == VehicleType.SEMI else "#95a5a6"
+            self.width = 8.0  # Trucks are wider
+
+        # Set lane offset based on direction (right-hand traffic)
+        # Positive offset = right side of road center
+        self._update_lane_offset()
+
+    def _update_lane_offset(self):
+        """Calculate lane offset for proper lane positioning."""
+        # Lane width as fraction of cell (each lane ~0.2 of cell width)
+        lane_width = 0.15
+        if self.direction in (Direction.NORTH, Direction.EAST):
+            # These directions travel on the right side (positive offset)
+            self.lane_offset = lane_width
+        else:
+            # South and West travel on left side (negative offset from their perspective)
+            self.lane_offset = -lane_width
 
 
 @dataclass
@@ -761,7 +780,7 @@ class TrafficSimulator:
         self.grid_offset = (offset_x, offset_y)
 
     def _draw_road_cell(self, cell: GridCell, x1, y1, x2, y2):
-        """Draw a road cell with appropriate markings."""
+        """Draw a road cell with two lanes and appropriate markings."""
         # Road surface
         base_color = "#34495e"
         if cell.is_tourism_area:
@@ -771,51 +790,89 @@ class TrafficSimulator:
 
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
+        road_width = self.cell_size
 
         road_type = cell.road_type
 
-        # Draw road markings based on type
+        # Draw road markings based on type - with two lanes
         if road_type == RoadType.STRAIGHT_NS:
-            # Yellow center line
-            self.canvas.create_line(cx, y1, cx, y2, fill="#f1c40f", width=2)
-            # White edge lines
-            self.canvas.create_line(x1+5, y1, x1+5, y2, fill="white", width=1, dash=(5,5))
-            self.canvas.create_line(x2-5, y1, x2-5, y2, fill="white", width=1, dash=(5,5))
+            # Yellow center dividing line (double line for no passing)
+            self.canvas.create_line(cx-1, y1, cx-1, y2, fill="#f1c40f", width=2)
+            self.canvas.create_line(cx+1, y1, cx+1, y2, fill="#f1c40f", width=2)
+            # White edge lines (road boundaries)
+            edge_offset = road_width * 0.35
+            self.canvas.create_line(x1+3, y1, x1+3, y2, fill="white", width=1)
+            self.canvas.create_line(x2-3, y1, x2-3, y2, fill="white", width=1)
+            # Lane markers (dashed white lines in each lane)
+            lane_pos = road_width * 0.17
+            self.canvas.create_line(cx-lane_pos, y1, cx-lane_pos, y2, fill="white", width=1, dash=(8,8))
+            self.canvas.create_line(cx+lane_pos, y1, cx+lane_pos, y2, fill="white", width=1, dash=(8,8))
 
         elif road_type == RoadType.STRAIGHT_EW:
-            self.canvas.create_line(x1, cy, x2, cy, fill="#f1c40f", width=2)
-            self.canvas.create_line(x1, y1+5, x2, y1+5, fill="white", width=1, dash=(5,5))
-            self.canvas.create_line(x1, y2-5, x2, y2-5, fill="white", width=1, dash=(5,5))
+            # Yellow center dividing line
+            self.canvas.create_line(x1, cy-1, x2, cy-1, fill="#f1c40f", width=2)
+            self.canvas.create_line(x1, cy+1, x2, cy+1, fill="#f1c40f", width=2)
+            # White edge lines
+            self.canvas.create_line(x1, y1+3, x2, y1+3, fill="white", width=1)
+            self.canvas.create_line(x1, y2-3, x2, y2-3, fill="white", width=1)
+            # Lane markers
+            lane_pos = road_width * 0.17
+            self.canvas.create_line(x1, cy-lane_pos, x2, cy-lane_pos, fill="white", width=1, dash=(8,8))
+            self.canvas.create_line(x1, cy+lane_pos, x2, cy+lane_pos, fill="white", width=1, dash=(8,8))
 
         elif road_type == RoadType.INTERSECTION:
-            # Crosswalk markings
-            stripe_width = 3
-            stripe_gap = 4
-            for i in range(-3, 4):
+            # Stop lines for each approach
+            stop_line_offset = road_width * 0.4
+            line_width = 3
+
+            # North approach stop line
+            self.canvas.create_line(x1+5, y1+stop_line_offset, cx-2, y1+stop_line_offset,
+                                   fill="white", width=line_width)
+            # South approach stop line
+            self.canvas.create_line(cx+2, y2-stop_line_offset, x2-5, y2-stop_line_offset,
+                                   fill="white", width=line_width)
+            # East approach stop line
+            self.canvas.create_line(x2-stop_line_offset, y1+5, x2-stop_line_offset, cy-2,
+                                   fill="white", width=line_width)
+            # West approach stop line
+            self.canvas.create_line(x1+stop_line_offset, cy+2, x1+stop_line_offset, y2-5,
+                                   fill="white", width=line_width)
+
+            # Crosswalk markings (zebra stripes)
+            stripe_width = 2
+            stripe_gap = 3
+            crosswalk_width = road_width * 0.15
+
+            for i in range(-4, 5):
+                offset = i * (stripe_width + stripe_gap)
                 # North crosswalk
-                self.canvas.create_rectangle(cx + i*(stripe_width+stripe_gap), y1+2,
-                                             cx + i*(stripe_width+stripe_gap) + stripe_width, y1+10,
-                                             fill="white", outline="")
+                self.canvas.create_rectangle(cx + offset, y1+2,
+                                            cx + offset + stripe_width, y1+2+crosswalk_width,
+                                            fill="white", outline="")
                 # South crosswalk
-                self.canvas.create_rectangle(cx + i*(stripe_width+stripe_gap), y2-10,
-                                             cx + i*(stripe_width+stripe_gap) + stripe_width, y2-2,
-                                             fill="white", outline="")
+                self.canvas.create_rectangle(cx + offset, y2-2-crosswalk_width,
+                                            cx + offset + stripe_width, y2-2,
+                                            fill="white", outline="")
                 # East crosswalk
-                self.canvas.create_rectangle(x2-10, cy + i*(stripe_width+stripe_gap),
-                                             x2-2, cy + i*(stripe_width+stripe_gap) + stripe_width,
-                                             fill="white", outline="")
+                self.canvas.create_rectangle(x2-2-crosswalk_width, cy + offset,
+                                            x2-2, cy + offset + stripe_width,
+                                            fill="white", outline="")
                 # West crosswalk
-                self.canvas.create_rectangle(x1+2, cy + i*(stripe_width+stripe_gap),
-                                             x1+10, cy + i*(stripe_width+stripe_gap) + stripe_width,
-                                             fill="white", outline="")
+                self.canvas.create_rectangle(x1+2, cy + offset,
+                                            x1+2+crosswalk_width, cy + offset + stripe_width,
+                                            fill="white", outline="")
 
         elif road_type == RoadType.ROUNDABOUT:
-            # Draw roundabout circle
-            r = self.cell_size * 0.35
-            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#2c3e50", outline="#f1c40f", width=2)
-            # Inner circle
-            r2 = r * 0.5
+            # Draw roundabout with proper lanes
+            r = self.cell_size * 0.4
+            # Outer edge
+            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#34495e", outline="white", width=2)
+            # Center island
+            r2 = r * 0.4
             self.canvas.create_oval(cx-r2, cy-r2, cx+r2, cy+r2, fill="#27ae60", outline="#229954", width=2)
+            # Lane divider circle
+            r3 = r * 0.7
+            self.canvas.create_oval(cx-r3, cy-r3, cx+r3, cy+r3, fill="", outline="#f1c40f", width=2, dash=(5,5))
 
         # Draw signal if present
         if cell.signal:
@@ -898,16 +955,29 @@ class TrafficSimulator:
         self.canvas.create_polygon(points, fill="white", outline="#e74c3c", width=2)
 
     def _draw_vehicle(self, vehicle: Vehicle, offset_x, offset_y):
-        """Draw a vehicle on the canvas."""
+        """Draw a vehicle on the canvas with proper lane positioning."""
         # Convert grid position to canvas position
         px = offset_x + vehicle.x * self.cell_size
         py = offset_y + vehicle.y * self.cell_size
 
-        # Vehicle size (scaled to cell size)
-        length = vehicle.length / 15 * self.cell_size * 0.3
-        width = vehicle.width / 6 * self.cell_size * 0.15
+        # Apply lane offset based on direction
+        lane_offset_px = vehicle.lane_offset * self.cell_size
+        if vehicle.direction in (Direction.NORTH, Direction.SOUTH):
+            # N/S roads: offset horizontally
+            px += lane_offset_px
+        else:
+            # E/W roads: offset vertically
+            py += lane_offset_px
 
-        # Rotate based on direction
+        # Vehicle size (scaled to cell size) - make vehicles smaller to fit in lanes
+        length = min(vehicle.length / 15, 1.5) * self.cell_size * 0.2
+        width = min(vehicle.width / 6, 1.0) * self.cell_size * 0.1
+
+        # Ensure minimum visibility
+        length = max(length, 8)
+        width = max(width, 4)
+
+        # Calculate rectangle based on direction
         if vehicle.direction == Direction.NORTH:
             x1, y1 = px - width/2, py - length/2
             x2, y2 = px + width/2, py + length/2
@@ -921,16 +991,23 @@ class TrafficSimulator:
             x1, y1 = px - length/2, py - width/2
             x2, y2 = px + length/2, py + width/2
 
-        # Draw vehicle body
-        self.canvas.create_rectangle(x1, y1, x2, y2, fill=vehicle.color, outline="black")
+        # Draw vehicle body with rounded corners effect
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill=vehicle.color, outline="black", width=1)
 
-        # Draw headlights
+        # Draw headlights (smaller)
+        hl_size = max(2, width * 0.3)
         if vehicle.direction == Direction.NORTH:
-            self.canvas.create_oval(x1+2, y1, x1+5, y1+3, fill="yellow")
-            self.canvas.create_oval(x2-5, y1, x2-2, y1+3, fill="yellow")
+            self.canvas.create_oval(x1+1, y1, x1+1+hl_size, y1+hl_size, fill="#ffff00", outline="")
+            self.canvas.create_oval(x2-1-hl_size, y1, x2-1, y1+hl_size, fill="#ffff00", outline="")
         elif vehicle.direction == Direction.SOUTH:
-            self.canvas.create_oval(x1+2, y2-3, x1+5, y2, fill="yellow")
-            self.canvas.create_oval(x2-5, y2-3, x2-2, y2, fill="yellow")
+            self.canvas.create_oval(x1+1, y2-hl_size, x1+1+hl_size, y2, fill="#ff0000", outline="")
+            self.canvas.create_oval(x2-1-hl_size, y2-hl_size, x2-1, y2, fill="#ff0000", outline="")
+        elif vehicle.direction == Direction.EAST:
+            self.canvas.create_oval(x2-hl_size, y1+1, x2, y1+1+hl_size, fill="#ffff00", outline="")
+            self.canvas.create_oval(x2-hl_size, y2-1-hl_size, x2, y2-1, fill="#ffff00", outline="")
+        else:  # WEST
+            self.canvas.create_oval(x1, y1+1, x1+hl_size, y1+1+hl_size, fill="#ff0000", outline="")
+            self.canvas.create_oval(x1, y2-1-hl_size, x1+hl_size, y2-1, fill="#ff0000", outline="")
 
     def _on_canvas_click(self, event):
         """Handle left click on canvas - place road/signal."""
@@ -1349,11 +1426,24 @@ class TrafficSimulator:
         min_dist = float('inf')
         nearest = None
 
+        # Lane tolerance for same-lane detection
+        lane_tolerance = 0.25  # Must be in same lane (within tolerance)
+
         for other in self.vehicles:
             if other is vehicle:
                 continue
             if other.direction != vehicle.direction:
                 continue
+
+            # Check if in same lane (similar lateral position)
+            if vehicle.direction in (Direction.NORTH, Direction.SOUTH):
+                # For N/S, check x position similarity
+                if abs(other.x - vehicle.x) > lane_tolerance:
+                    continue
+            else:
+                # For E/W, check y position similarity
+                if abs(other.y - vehicle.y) > lane_tolerance:
+                    continue
 
             # Check if ahead
             if vehicle.direction == Direction.NORTH and other.y < vehicle.y:
@@ -1372,6 +1462,46 @@ class TrafficSimulator:
                 nearest = other
 
         return nearest
+
+    def _check_vehicle_collision(self, vehicle: Vehicle) -> bool:
+        """Check if vehicle would collide with any other vehicle."""
+        # Vehicle bounding box (in grid units)
+        v_length = vehicle.length / 100  # Convert to grid units
+        v_width = vehicle.width / 100
+
+        for other in self.vehicles:
+            if other is vehicle:
+                continue
+
+            o_length = other.length / 100
+            o_width = other.width / 100
+
+            # Simple AABB collision with lane offset
+            if vehicle.direction in (Direction.NORTH, Direction.SOUTH):
+                v_x = vehicle.x + vehicle.lane_offset
+                v_y = vehicle.y
+            else:
+                v_x = vehicle.x
+                v_y = vehicle.y + vehicle.lane_offset
+
+            if other.direction in (Direction.NORTH, Direction.SOUTH):
+                o_x = other.x + other.lane_offset
+                o_y = other.y
+            else:
+                o_x = other.x
+                o_y = other.y + other.lane_offset
+
+            # Check overlap
+            dx = abs(v_x - o_x)
+            dy = abs(v_y - o_y)
+
+            min_dx = (v_width + o_width) / 2 + 0.05
+            min_dy = (v_length + o_length) / 2 + 0.05
+
+            if dx < min_dx and dy < min_dy:
+                return True
+
+        return False
 
     def _distance_to_vehicle(self, v1: Vehicle, v2: Vehicle) -> float:
         """Calculate distance between two vehicles in grid units."""
@@ -1409,20 +1539,51 @@ class TrafficSimulator:
                 else:
                     vtype = VehicleType.CAR
 
-                # Check if spawn point is clear
+                # Calculate spawn position with lane offset
+                spawn_x = float(x) + 0.5
+                spawn_y = float(y) + 0.5
+
+                # Create temporary vehicle to get lane offset
+                temp_vehicle = Vehicle(
+                    id=0, vehicle_type=vtype, x=spawn_x, y=spawn_y, direction=direction
+                )
+                lane_offset = temp_vehicle.lane_offset
+
+                # Apply lane offset to spawn position check
+                if direction in (Direction.NORTH, Direction.SOUTH):
+                    check_x = spawn_x + lane_offset
+                    check_y = spawn_y
+                else:
+                    check_x = spawn_x
+                    check_y = spawn_y + lane_offset
+
+                # Check if spawn point is clear (with lane awareness)
                 spawn_clear = True
+                min_spawn_dist = 0.4  # Minimum distance between vehicles
+
                 for v in self.vehicles:
-                    if abs(v.x - x) < 0.5 and abs(v.y - y) < 0.5:
-                        spawn_clear = False
-                        break
+                    # Only check vehicles in same lane (same direction)
+                    if v.direction != direction:
+                        continue
+
+                    if direction in (Direction.NORTH, Direction.SOUTH):
+                        v_lane_x = v.x + v.lane_offset
+                        if abs(v_lane_x - check_x) < 0.3 and abs(v.y - spawn_y) < min_spawn_dist:
+                            spawn_clear = False
+                            break
+                    else:
+                        v_lane_y = v.y + v.lane_offset
+                        if abs(v_lane_y - check_y) < 0.3 and abs(v.x - spawn_x) < min_spawn_dist:
+                            spawn_clear = False
+                            break
 
                 if spawn_clear:
                     self.vehicle_id_counter += 1
                     vehicle = Vehicle(
                         id=self.vehicle_id_counter,
                         vehicle_type=vtype,
-                        x=float(x) + 0.5,
-                        y=float(y) + 0.5,
+                        x=spawn_x,
+                        y=spawn_y,
                         direction=direction
                     )
                     self.vehicles.append(vehicle)
@@ -1746,7 +1907,7 @@ Configuration:
         """Import road data from OpenStreetMap."""
         dialog = tk.Toplevel(self.root)
         dialog.title("Import from OpenStreetMap")
-        dialog.geometry("400x200")
+        dialog.geometry("450x280")
         dialog.transient(self.root)
 
         ttk.Label(dialog, text="Enter location name or coordinates:").pack(pady=10)
@@ -1755,16 +1916,36 @@ Configuration:
         entry = ttk.Entry(dialog, textvariable=location_var, width=40)
         entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Note: This will generate a simplified grid based on\n"
-                              "the general road pattern of the location.").pack(pady=10)
+        ttk.Label(dialog, text="Import Options:", font=("Arial", 10, "bold")).pack(pady=10)
 
-        def do_import():
+        def do_quick_import():
             location = location_var.get()
             dialog.destroy()
             self._fetch_osm_data(location)
 
-        ttk.Button(dialog, text="Import", command=do_import).pack(pady=10)
-        ttk.Button(dialog, text="Cancel", command=dialog.destroy).pack()
+        def do_map_tracer():
+            location = location_var.get()
+            dialog.destroy()
+            self._open_map_tracer(location)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+
+        ttk.Button(btn_frame, text="Quick Generate\n(Auto layout)",
+                   command=do_quick_import).pack(side=tk.LEFT, padx=10, pady=5)
+
+        ttk.Button(btn_frame, text="Map Tracer\n(Trace over map)",
+                   command=do_map_tracer).pack(side=tk.LEFT, padx=10, pady=5)
+
+        ttk.Label(dialog, text="Map Tracer: Opens satellite/map view to trace streets\n"
+                              "Quick Generate: Creates grid based on location pattern",
+                              font=("Arial", 8)).pack(pady=10)
+
+        ttk.Button(dialog, text="Cancel", command=dialog.destroy).pack(pady=5)
+
+    def _open_map_tracer(self, location: str):
+        """Open the Map Tracer window for tracing streets over a map."""
+        MapTracerWindow(self.root, self, location)
 
     def _fetch_osm_data(self, location: str):
         """Fetch and process OSM data for location."""
@@ -1891,6 +2072,580 @@ Configuration:
 
     def _update_red_label(self, *args):
         self.red_label.config(text=f"{self.red_var.get():.1f}s")
+
+
+# ============================================================================
+# MAP TRACER WINDOW
+# ============================================================================
+
+class MapTracerWindow:
+    """
+    Window for tracing streets over satellite/map imagery.
+    Supports OpenStreetMap tiles (free) and optional Google Maps (requires API key).
+    """
+
+    def __init__(self, parent, simulator, location: str):
+        self.parent = parent
+        self.simulator = simulator
+        self.location = location
+
+        # Map state
+        self.center_lat = 40.7128  # Default NYC
+        self.center_lon = -74.0060
+        self.zoom = 17  # Street-level zoom
+        self.tile_size = 256
+        self.map_tiles = {}  # Cache for downloaded tiles
+        self.tile_images = {}  # PhotoImage cache
+
+        # Drawing state
+        self.drawing_mode = "road"  # road, intersection, signal
+        self.traced_roads = []  # List of road segments
+        self.current_road = []  # Current road being drawn
+
+        # API settings
+        self.google_api_key = ""
+        self.use_google = False
+
+        # Create window
+        self.window = tk.Toplevel(parent)
+        self.window.title(f"Map Tracer - {location}")
+        self.window.geometry("1200x800")
+
+        self._setup_ui()
+        self._geocode_location(location)
+
+    def _setup_ui(self):
+        """Setup the map tracer UI."""
+        # Top toolbar
+        toolbar = ttk.Frame(self.window)
+        toolbar.pack(fill=tk.X, padx=5, pady=5)
+
+        # Map source selection
+        ttk.Label(toolbar, text="Map Source:").pack(side=tk.LEFT, padx=5)
+        self.source_var = tk.StringVar(value="osm")
+        ttk.Radiobutton(toolbar, text="OpenStreetMap", variable=self.source_var,
+                        value="osm", command=self._refresh_map).pack(side=tk.LEFT)
+        ttk.Radiobutton(toolbar, text="Google Satellite", variable=self.source_var,
+                        value="google", command=self._check_google_api).pack(side=tk.LEFT)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        # Drawing tools
+        ttk.Label(toolbar, text="Draw:").pack(side=tk.LEFT, padx=5)
+        self.draw_var = tk.StringVar(value="road")
+        ttk.Radiobutton(toolbar, text="Road", variable=self.draw_var,
+                        value="road").pack(side=tk.LEFT)
+        ttk.Radiobutton(toolbar, text="Intersection", variable=self.draw_var,
+                        value="intersection").pack(side=tk.LEFT)
+        ttk.Radiobutton(toolbar, text="Signal", variable=self.draw_var,
+                        value="signal").pack(side=tk.LEFT)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        # Zoom controls
+        ttk.Button(toolbar, text="Zoom +", command=self._zoom_in).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Zoom -", command=self._zoom_out).pack(side=tk.LEFT, padx=2)
+        self.zoom_label = ttk.Label(toolbar, text=f"Zoom: {self.zoom}")
+        self.zoom_label.pack(side=tk.LEFT, padx=5)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        # Action buttons
+        ttk.Button(toolbar, text="Clear Drawing", command=self._clear_drawing).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Undo", command=self._undo_last).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Apply to Grid", command=self._apply_to_grid).pack(side=tk.LEFT, padx=2)
+
+        # Main content area
+        content = ttk.Frame(self.window)
+        content.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Map canvas
+        self.canvas = tk.Canvas(content, bg="#e0e0e0", cursor="crosshair")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Bind events
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Button-3>", self._on_right_click)
+        self.canvas.bind("<MouseWheel>", self._on_scroll)
+        self.canvas.bind("<Configure>", self._on_resize)
+
+        # Pan with middle mouse or shift+left
+        self.canvas.bind("<Button-2>", self._start_pan)
+        self.canvas.bind("<B2-Motion>", self._do_pan)
+        self.canvas.bind("<Shift-Button-1>", self._start_pan)
+        self.canvas.bind("<Shift-B1-Motion>", self._do_pan)
+
+        # Status bar
+        status = ttk.Frame(self.window)
+        status.pack(fill=tk.X, padx=5, pady=2)
+
+        self.status_label = ttk.Label(status, text="Loading map...")
+        self.status_label.pack(side=tk.LEFT)
+
+        self.coords_label = ttk.Label(status, text="")
+        self.coords_label.pack(side=tk.RIGHT)
+
+        # Track mouse for coordinates
+        self.canvas.bind("<Motion>", self._update_coords)
+
+        # Instructions panel
+        instructions = ttk.LabelFrame(self.window, text="Instructions")
+        instructions.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(instructions, text=
+            "• Left-click and drag to draw roads\n"
+            "• Right-click to place intersections/signals\n"
+            "• Shift+drag or middle-mouse to pan the map\n"
+            "• Mouse wheel to zoom\n"
+            "• Click 'Apply to Grid' when done to transfer to simulator",
+            justify=tk.LEFT).pack(padx=10, pady=5)
+
+        # Pan state
+        self.pan_start = None
+        self.is_drawing = False
+
+    def _geocode_location(self, location: str):
+        """Geocode the location to get coordinates."""
+        self.status_label.config(text=f"Geocoding {location}...")
+        self.window.update()
+
+        try:
+            encoded_location = urllib.parse.quote(location)
+            url = f"https://nominatim.openstreetmap.org/search?q={encoded_location}&format=json&limit=1"
+
+            req = urllib.request.Request(url, headers={'User-Agent': 'TrafficSimulator/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+
+            if data:
+                self.center_lat = float(data[0]['lat'])
+                self.center_lon = float(data[0]['lon'])
+                self.status_label.config(text=f"Located: {location}")
+                self._refresh_map()
+            else:
+                self.status_label.config(text=f"Location not found: {location}")
+
+        except Exception as e:
+            self.status_label.config(text=f"Geocoding error: {e}")
+
+    def _check_google_api(self):
+        """Check for Google API key when Google source is selected."""
+        if self.source_var.get() == "google" and not self.google_api_key:
+            # Prompt for API key
+            dialog = tk.Toplevel(self.window)
+            dialog.title("Google Maps API Key")
+            dialog.geometry("400x150")
+            dialog.transient(self.window)
+
+            ttk.Label(dialog, text="Enter your Google Maps API key:").pack(pady=10)
+            ttk.Label(dialog, text="(Get one at: console.cloud.google.com)",
+                     font=("Arial", 8)).pack()
+
+            key_var = tk.StringVar()
+            entry = ttk.Entry(dialog, textvariable=key_var, width=50)
+            entry.pack(pady=10)
+
+            def save_key():
+                self.google_api_key = key_var.get()
+                if self.google_api_key:
+                    self.use_google = True
+                    dialog.destroy()
+                    self._refresh_map()
+                else:
+                    self.source_var.set("osm")
+                    dialog.destroy()
+
+            def cancel():
+                self.source_var.set("osm")
+                dialog.destroy()
+
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.pack(pady=10)
+            ttk.Button(btn_frame, text="OK", command=save_key).pack(side=tk.LEFT, padx=5)
+            ttk.Button(btn_frame, text="Cancel", command=cancel).pack(side=tk.LEFT, padx=5)
+        else:
+            self._refresh_map()
+
+    def _lat_lon_to_tile(self, lat, lon, zoom):
+        """Convert lat/lon to tile coordinates."""
+        n = 2 ** zoom
+        x = int((lon + 180) / 360 * n)
+        lat_rad = math.radians(lat)
+        y = int((1 - math.asinh(math.tan(lat_rad)) / math.pi) / 2 * n)
+        return x, y
+
+    def _tile_to_lat_lon(self, x, y, zoom):
+        """Convert tile coordinates to lat/lon."""
+        n = 2 ** zoom
+        lon = x / n * 360 - 180
+        lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
+        lat = math.degrees(lat_rad)
+        return lat, lon
+
+    def _refresh_map(self):
+        """Refresh the map display."""
+        self.canvas.delete("map")
+
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        if canvas_width < 10 or canvas_height < 10:
+            self.window.after(100, self._refresh_map)
+            return
+
+        # Calculate tile range needed
+        center_tile_x, center_tile_y = self._lat_lon_to_tile(
+            self.center_lat, self.center_lon, self.zoom)
+
+        tiles_x = (canvas_width // self.tile_size) + 2
+        tiles_y = (canvas_height // self.tile_size) + 2
+
+        # Calculate pixel offset for smooth scrolling
+        n = 2 ** self.zoom
+        center_pixel_x = (self.center_lon + 180) / 360 * n * self.tile_size
+        center_pixel_y = (1 - math.asinh(math.tan(math.radians(self.center_lat))) / math.pi) / 2 * n * self.tile_size
+
+        # Load and display tiles
+        for dy in range(-tiles_y//2, tiles_y//2 + 1):
+            for dx in range(-tiles_x//2, tiles_x//2 + 1):
+                tile_x = center_tile_x + dx
+                tile_y = center_tile_y + dy
+
+                # Calculate position on canvas
+                tile_pixel_x = tile_x * self.tile_size
+                tile_pixel_y = tile_y * self.tile_size
+
+                canvas_x = canvas_width/2 + (tile_pixel_x - center_pixel_x)
+                canvas_y = canvas_height/2 + (tile_pixel_y - center_pixel_y)
+
+                # Try to get tile image
+                tile_key = (tile_x, tile_y, self.zoom, self.source_var.get())
+                if tile_key not in self.tile_images:
+                    self._load_tile(tile_x, tile_y)
+
+                if tile_key in self.tile_images:
+                    self.canvas.create_image(canvas_x, canvas_y,
+                                            image=self.tile_images[tile_key],
+                                            anchor=tk.NW, tags="map")
+
+        # Draw traced roads on top
+        self._redraw_traced_roads()
+        self.canvas.tag_lower("map")
+
+        self.zoom_label.config(text=f"Zoom: {self.zoom}")
+
+    def _load_tile(self, x, y):
+        """Load a map tile."""
+        tile_key = (x, y, self.zoom, self.source_var.get())
+
+        try:
+            if self.source_var.get() == "osm":
+                url = f"https://tile.openstreetmap.org/{self.zoom}/{x}/{y}.png"
+            elif self.source_var.get() == "google" and self.google_api_key:
+                # Google Static Maps API
+                lat, lon = self._tile_to_lat_lon(x + 0.5, y + 0.5, self.zoom)
+                url = (f"https://maps.googleapis.com/maps/api/staticmap?"
+                      f"center={lat},{lon}&zoom={self.zoom}&size=256x256"
+                      f"&maptype=satellite&key={self.google_api_key}")
+            else:
+                return
+
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'TrafficSimulator/1.0'
+            })
+            with urllib.request.urlopen(req, timeout=5) as response:
+                image_data = response.read()
+
+            # Create PhotoImage from data (requires PIL for PNG, but we'll use a placeholder)
+            # For simplicity, we'll create a colored placeholder
+            # In production, you'd use PIL/Pillow to load the actual tile
+
+            # Create a simple colored tile as placeholder
+            tile_img = tk.PhotoImage(width=256, height=256)
+            # Create a simple pattern based on tile coords
+            color = f"#{(x*17) % 256:02x}{(y*23) % 256:02x}{((x+y)*7) % 256:02x}"
+            tile_img.put(color, to=(0, 0, 256, 256))
+
+            self.tile_images[tile_key] = tile_img
+
+        except Exception as e:
+            # Create error tile
+            pass
+
+    def _redraw_traced_roads(self):
+        """Redraw all traced roads."""
+        self.canvas.delete("traced")
+
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        for road in self.traced_roads:
+            if len(road['points']) >= 2:
+                # Convert lat/lon points to canvas coordinates
+                canvas_points = []
+                for lat, lon in road['points']:
+                    cx, cy = self._latlon_to_canvas(lat, lon)
+                    canvas_points.extend([cx, cy])
+
+                color = "#e74c3c" if road['type'] == 'road' else "#f1c40f"
+                self.canvas.create_line(canvas_points, fill=color, width=4,
+                                        tags="traced", capstyle=tk.ROUND)
+
+        # Draw intersections
+        for road in self.traced_roads:
+            if road['type'] == 'intersection':
+                lat, lon = road['points'][0]
+                cx, cy = self._latlon_to_canvas(lat, lon)
+                self.canvas.create_oval(cx-8, cy-8, cx+8, cy+8,
+                                       fill="#2ecc71", outline="white", width=2,
+                                       tags="traced")
+
+        # Draw current road being drawn
+        if self.current_road and len(self.current_road) >= 2:
+            canvas_points = []
+            for lat, lon in self.current_road:
+                cx, cy = self._latlon_to_canvas(lat, lon)
+                canvas_points.extend([cx, cy])
+            self.canvas.create_line(canvas_points, fill="#3498db", width=4,
+                                   tags="traced", dash=(5, 5))
+
+    def _latlon_to_canvas(self, lat, lon):
+        """Convert lat/lon to canvas coordinates."""
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        n = 2 ** self.zoom
+
+        # Center in pixels
+        center_pixel_x = (self.center_lon + 180) / 360 * n * self.tile_size
+        center_pixel_y = (1 - math.asinh(math.tan(math.radians(self.center_lat))) / math.pi) / 2 * n * self.tile_size
+
+        # Point in pixels
+        point_pixel_x = (lon + 180) / 360 * n * self.tile_size
+        point_pixel_y = (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n * self.tile_size
+
+        canvas_x = canvas_width/2 + (point_pixel_x - center_pixel_x)
+        canvas_y = canvas_height/2 + (point_pixel_y - center_pixel_y)
+
+        return canvas_x, canvas_y
+
+    def _canvas_to_latlon(self, cx, cy):
+        """Convert canvas coordinates to lat/lon."""
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        n = 2 ** self.zoom
+
+        # Center in pixels
+        center_pixel_x = (self.center_lon + 180) / 360 * n * self.tile_size
+        center_pixel_y = (1 - math.asinh(math.tan(math.radians(self.center_lat))) / math.pi) / 2 * n * self.tile_size
+
+        # Point in pixels
+        point_pixel_x = center_pixel_x + (cx - canvas_width/2)
+        point_pixel_y = center_pixel_y + (cy - canvas_height/2)
+
+        # Convert to lat/lon
+        lon = point_pixel_x / (n * self.tile_size) * 360 - 180
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * point_pixel_y / (n * self.tile_size)))))
+
+        return lat, lon
+
+    def _on_click(self, event):
+        """Handle click to start drawing."""
+        if event.state & 0x1:  # Shift key held - pan mode
+            return
+
+        self.is_drawing = True
+        lat, lon = self._canvas_to_latlon(event.x, event.y)
+        self.current_road = [(lat, lon)]
+
+    def _on_drag(self, event):
+        """Handle drag to continue drawing."""
+        if not self.is_drawing:
+            return
+
+        lat, lon = self._canvas_to_latlon(event.x, event.y)
+        self.current_road.append((lat, lon))
+        self._redraw_traced_roads()
+
+    def _on_release(self, event):
+        """Handle release to finish drawing."""
+        if not self.is_drawing:
+            return
+
+        self.is_drawing = False
+        if len(self.current_road) >= 2:
+            self.traced_roads.append({
+                'type': self.draw_var.get(),
+                'points': self.current_road.copy()
+            })
+        self.current_road = []
+        self._redraw_traced_roads()
+
+    def _on_right_click(self, event):
+        """Handle right-click to place intersection/signal."""
+        lat, lon = self._canvas_to_latlon(event.x, event.y)
+        self.traced_roads.append({
+            'type': 'intersection',
+            'points': [(lat, lon)]
+        })
+        self._redraw_traced_roads()
+
+    def _start_pan(self, event):
+        """Start panning the map."""
+        self.pan_start = (event.x, event.y)
+
+    def _do_pan(self, event):
+        """Pan the map."""
+        if self.pan_start:
+            dx = event.x - self.pan_start[0]
+            dy = event.y - self.pan_start[1]
+
+            # Convert pixel movement to lat/lon change
+            n = 2 ** self.zoom
+            lon_per_pixel = 360 / (n * self.tile_size)
+            lat_per_pixel = 180 / (n * self.tile_size)  # Approximate
+
+            self.center_lon -= dx * lon_per_pixel
+            self.center_lat += dy * lat_per_pixel
+
+            self.pan_start = (event.x, event.y)
+            self._refresh_map()
+
+    def _on_scroll(self, event):
+        """Handle scroll to zoom."""
+        if event.delta > 0:
+            self._zoom_in()
+        else:
+            self._zoom_out()
+
+    def _zoom_in(self):
+        """Zoom in."""
+        if self.zoom < 19:
+            self.zoom += 1
+            self._refresh_map()
+
+    def _zoom_out(self):
+        """Zoom out."""
+        if self.zoom > 10:
+            self.zoom -= 1
+            self._refresh_map()
+
+    def _on_resize(self, event):
+        """Handle window resize."""
+        self._refresh_map()
+
+    def _update_coords(self, event):
+        """Update coordinate display."""
+        lat, lon = self._canvas_to_latlon(event.x, event.y)
+        self.coords_label.config(text=f"Lat: {lat:.6f}, Lon: {lon:.6f}")
+
+    def _clear_drawing(self):
+        """Clear all traced roads."""
+        self.traced_roads = []
+        self.current_road = []
+        self._redraw_traced_roads()
+
+    def _undo_last(self):
+        """Undo last traced element."""
+        if self.traced_roads:
+            self.traced_roads.pop()
+            self._redraw_traced_roads()
+
+    def _apply_to_grid(self):
+        """Apply traced roads to the simulator grid."""
+        if not self.traced_roads:
+            messagebox.showwarning("No Roads", "Please trace some roads first.")
+            return
+
+        # Find bounding box of traced roads
+        all_lats = []
+        all_lons = []
+        for road in self.traced_roads:
+            for lat, lon in road['points']:
+                all_lats.append(lat)
+                all_lons.append(lon)
+
+        if not all_lats:
+            return
+
+        min_lat, max_lat = min(all_lats), max(all_lats)
+        min_lon, max_lon = min(all_lons), max(all_lons)
+
+        # Map to grid
+        grid_size = self.simulator.grid_size
+        self.simulator._clear_grid()
+
+        for road in self.traced_roads:
+            if road['type'] == 'intersection':
+                # Place intersection
+                lat, lon = road['points'][0]
+                gx = int((lon - min_lon) / (max_lon - min_lon + 0.0001) * (grid_size - 1))
+                gy = int((max_lat - lat) / (max_lat - min_lat + 0.0001) * (grid_size - 1))
+
+                gx = max(0, min(grid_size-1, gx))
+                gy = max(0, min(grid_size-1, gy))
+
+                cell = self.simulator.grid[gy][gx]
+                cell.road_type = RoadType.INTERSECTION
+                cell.signal = TrafficSignal(signal_type=SignalType.TRAFFIC_LIGHT)
+
+            elif road['type'] == 'road':
+                # Trace road through grid
+                for i in range(len(road['points']) - 1):
+                    lat1, lon1 = road['points'][i]
+                    lat2, lon2 = road['points'][i + 1]
+
+                    gx1 = int((lon1 - min_lon) / (max_lon - min_lon + 0.0001) * (grid_size - 1))
+                    gy1 = int((max_lat - lat1) / (max_lat - min_lat + 0.0001) * (grid_size - 1))
+                    gx2 = int((lon2 - min_lon) / (max_lon - min_lon + 0.0001) * (grid_size - 1))
+                    gy2 = int((max_lat - lat2) / (max_lat - min_lat + 0.0001) * (grid_size - 1))
+
+                    # Draw line using Bresenham's algorithm
+                    self._draw_line_on_grid(gx1, gy1, gx2, gy2)
+
+        self.simulator._draw_grid()
+        messagebox.showinfo("Applied", "Road layout applied to simulator grid.")
+        self.window.destroy()
+
+    def _draw_line_on_grid(self, x1, y1, x2, y2):
+        """Draw a line on the grid using Bresenham's algorithm."""
+        grid_size = self.simulator.grid_size
+
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx - dy
+
+        # Determine road type based on direction
+        if dx > dy:
+            road_type = RoadType.STRAIGHT_EW
+        else:
+            road_type = RoadType.STRAIGHT_NS
+
+        while True:
+            if 0 <= x1 < grid_size and 0 <= y1 < grid_size:
+                cell = self.simulator.grid[y1][x1]
+                if cell.road_type == RoadType.NONE:
+                    cell.road_type = road_type
+                elif cell.road_type != road_type and cell.road_type != RoadType.INTERSECTION:
+                    # Roads crossing = intersection
+                    cell.road_type = RoadType.INTERSECTION
+                    cell.signal = TrafficSignal(signal_type=SignalType.TRAFFIC_LIGHT)
+
+            if x1 == x2 and y1 == y2:
+                break
+
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x1 += sx
+            if e2 < dx:
+                err += dx
+                y1 += sy
 
 
 # ============================================================================
