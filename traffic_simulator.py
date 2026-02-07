@@ -300,7 +300,7 @@ class TrafficSimulator:
         self.root.geometry("1600x900")
 
         # Simulation state
-        self.grid_size = 8  # 8x8 grid
+        self.grid_size = 12  # 12x12 grid (can be changed via UI)
         self.cell_size = 60  # pixels per cell
         self.grid: List[List[GridCell]] = []
         self.vehicles: List[Vehicle] = []
@@ -670,6 +670,28 @@ class TrafficSimulator:
         for i, (text, stype) in enumerate(signal_types):
             ttk.Radiobutton(signal_frame, text=text, variable=self.signal_type_var,
                            value=stype).grid(row=i//2, column=i%2, sticky="w", padx=5)
+
+        # Grid Size selector
+        grid_frame = ttk.LabelFrame(build_content, text="Grid Size")
+        grid_frame.pack(fill=tk.X, pady=5)
+
+        size_frame = ttk.Frame(grid_frame)
+        size_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(size_frame, text="Size:").pack(side=tk.LEFT)
+        self.grid_size_var = tk.IntVar(value=self.grid_size)
+        grid_sizes = [8, 10, 12, 16, 20, 24, 32]
+        self.grid_size_combo = ttk.Combobox(size_frame, textvariable=self.grid_size_var,
+                                            values=grid_sizes, width=5, state="readonly")
+        self.grid_size_combo.pack(side=tk.LEFT, padx=5)
+        self.grid_size_label = ttk.Label(size_frame, text=f"({self.grid_size}x{self.grid_size})")
+        self.grid_size_label.pack(side=tk.LEFT)
+
+        ttk.Button(grid_frame, text="Apply Grid Size",
+                   command=self._apply_grid_size).pack(fill=tk.X, padx=5, pady=2)
+
+        ttk.Label(grid_frame, text="Note: Larger grids need more CPU",
+                  font=("Arial", 8)).pack(padx=5)
 
         # Generation buttons
         gen_frame = ttk.LabelFrame(build_content, text="Generation")
@@ -2129,6 +2151,39 @@ Configuration:
         """Update the current build mode."""
         self.build_mode = self.build_mode_var.get()
 
+    def _apply_grid_size(self):
+        """Apply new grid size, resetting the simulation."""
+        new_size = self.grid_size_var.get()
+
+        if new_size == self.grid_size:
+            return
+
+        # Confirm if simulation has data
+        if self.vehicles or any(cell.road_type != RoadType.NONE
+                                for row in self.grid for cell in row):
+            if not messagebox.askyesno("Confirm",
+                f"Changing grid size to {new_size}x{new_size} will clear the current layout.\nContinue?"):
+                self.grid_size_var.set(self.grid_size)
+                return
+
+        # Update grid size
+        old_size = self.grid_size
+        self.grid_size = new_size
+
+        # Clear and reinitialize
+        self.vehicles.clear()
+        self.selected_vehicle = None
+        self.sim_time = 0.0
+        self.current_stats = SimulationStats(name="Current")
+
+        # Reinitialize grid
+        self._init_grid()
+        self._draw_grid()
+
+        # Update label
+        self.grid_size_label.config(text=f"({new_size}x{new_size})")
+        self.status_label.config(text=f"Grid resized from {old_size}x{old_size} to {new_size}x{new_size}")
+
     def _generate_random_city(self):
         """Generate a random city grid layout."""
         self._clear_grid()
@@ -2348,16 +2403,21 @@ Configuration:
     def _fetch_real_streets(self, lat: float, lon: float) -> bool:
         """Fetch real street network data from Overpass API."""
         try:
-            # Calculate bounding box (roughly 500m x 500m area)
+            # Calculate bounding box - scale with grid size
+            # Base: 500m for 8x8 grid, scales proportionally
             # 1 degree latitude ≈ 111km, 1 degree longitude varies with latitude
-            lat_delta = 0.005  # ~500m
-            lon_delta = 0.005 / math.cos(math.radians(lat))
+            scale_factor = self.grid_size / 8.0
+            base_delta = 0.005  # ~500m for 8x8
+            lat_delta = base_delta * scale_factor
+            lon_delta = lat_delta / math.cos(math.radians(lat))
 
             bbox = f"{lat - lat_delta},{lon - lon_delta},{lat + lat_delta},{lon + lon_delta}"
 
             # Overpass query for roads and traffic signals
+            # Timeout scales with grid size
+            timeout = min(60, int(25 * scale_factor))
             query = f"""
-            [out:json][timeout:25];
+            [out:json][timeout:{timeout}];
             (
               way["highway"~"primary|secondary|tertiary|residential|trunk"]({bbox});
               node["highway"="traffic_signals"]({bbox});
