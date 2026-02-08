@@ -20,6 +20,14 @@ import copy
 import threading
 import urllib.request
 import urllib.parse
+import io
+
+# Optional PIL/Pillow for map tile loading
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 
 # ============================================================================
@@ -207,6 +215,10 @@ class Vehicle:
     spawn_time: float = 0.0
     stops_count: int = 0
     intersections_passed: int = 0
+    # Per-intersection stop tracking
+    last_stop_intersection: Optional[Tuple[int, int]] = None  # Grid coordinates of last stop
+    time_stopped_at_intersection: float = 0.0  # Time stopped at current intersection
+    has_completed_stop: bool = False  # Whether we've fulfilled stop requirement
 
     def __post_init__(self):
         if self.vehicle_type == VehicleType.CAR:
@@ -1683,7 +1695,7 @@ class TrafficSimulator:
             # Check for signals
             should_stop = False
             if cell.signal:
-                should_stop = self._should_vehicle_stop(vehicle, cell.signal)
+                should_stop = self._should_vehicle_stop(vehicle, cell.signal, dt)
 
             # Check for vehicles ahead
             vehicle_ahead = self._get_vehicle_ahead(vehicle)
@@ -1743,61 +1755,135 @@ class TrafficSimulator:
             self.current_stats.total_stopped_time += v.total_stopped_time
             self.current_stats.total_distance += v.distance_traveled
 
-    def _should_vehicle_stop(self, vehicle: Vehicle, signal: TrafficSignal) -> bool:
+    def _should_vehicle_stop(self, vehicle: Vehicle, signal: TrafficSignal, dt: float = 0.016) -> bool:
         """Determine if vehicle should stop for a signal."""
+        # Get current grid cell
+        gx, gy = int(vehicle.x), int(vehicle.y)
+        current_intersection = (gx, gy)
+
         # Get vehicle's position within the cell
-        cell_x = vehicle.x - int(vehicle.x)
-        cell_y = vehicle.y - int(vehicle.y)
+        cell_x = vehicle.x - gx
+        cell_y = vehicle.y - gy
 
-        # Determine if vehicle is approaching or in the intersection
-        # Stop lines are at about 0.4 from edge
-        stop_line_threshold = 0.4
-        in_intersection = (0.3 < cell_x < 0.7 and 0.3 < cell_y < 0.7)
+        # Determine if vehicle is in the intersection center
+        in_intersection = (0.35 < cell_x < 0.65 and 0.35 < cell_y < 0.65)
 
-        # If already in intersection, don't stop (keep moving to clear)
-        if in_intersection and vehicle.speed > 5:
+        # Check if approaching stop line (depends on direction)
+        # Stop line is about 0.3-0.4 from the edge vehicle is entering from
+        approaching_stop = False
+        past_stop_line = False
+
+        if vehicle.direction == Direction.NORTH:
+            # Entering from bottom, stop line at y ~0.7
+            approaching_stop = 0.55 < cell_y < 0.85
+            past_stop_line = cell_y <= 0.55
+        elif vehicle.direction == Direction.SOUTH:
+            # Entering from top, stop line at y ~0.3
+            approaching_stop = 0.15 < cell_y < 0.45
+            past_stop_line = cell_y >= 0.45
+        elif vehicle.direction == Direction.EAST:
+            # Entering from left, stop line at x ~0.3
+            approaching_stop = 0.15 < cell_x < 0.45
+            past_stop_line = cell_x >= 0.45
+        elif vehicle.direction == Direction.WEST:
+            # Entering from right, stop line at x ~0.7
+            approaching_stop = 0.55 < cell_x < 0.85
+            past_stop_line = cell_x <= 0.55
+
+        # Track intersection changes - reset stop state when entering new intersection
+        if vehicle.last_stop_intersection != current_intersection:
+            vehicle.last_stop_intersection = current_intersection
+            vehicle.time_stopped_at_intersection = 0.0
+            vehicle.has_completed_stop = False
+
+        # If past the stop line and in intersection, keep moving to clear it
+        if past_stop_line and vehicle.speed > 2:
             return False
 
-        # Check if approaching stop line
-        approaching_stop = False
-        if vehicle.direction == Direction.NORTH:
-            approaching_stop = cell_y > (1 - stop_line_threshold) and cell_y < 0.9
-        elif vehicle.direction == Direction.SOUTH:
-            approaching_stop = cell_y < stop_line_threshold and cell_y > 0.1
-        elif vehicle.direction == Direction.EAST:
-            approaching_stop = cell_x < stop_line_threshold and cell_x > 0.1
-        elif vehicle.direction == Direction.WEST:
-            approaching_stop = cell_x > (1 - stop_line_threshold) and cell_x < 0.9
-
+        # Handle different signal types
         if signal.signal_type == SignalType.TRAFFIC_LIGHT:
             state = signal.states.get(vehicle.direction, SignalState.RED)
+
             if state == SignalState.RED:
-                # Only stop if approaching, not if already past
-                if approaching_stop or (not in_intersection and vehicle.speed < 5):
+                # Must stop at red light
+                if approaching_stop or (not past_stop_line and vehicle.speed < 3):
                     return True
+
             elif state == SignalState.YELLOW:
                 # Stop if can't clear intersection safely
-                time_to_clear = 0.5 / max(vehicle.speed * 1.467 / 100, 0.1)
-                if time_to_clear > signal.yellow_time * 0.5 and approaching_stop:
-                    return True
+                # Calculate time needed to clear at current speed
+                if vehicle.speed > 0:
+                    dist_to_clear = 0.6  # Distance to fully clear intersection
+                    time_to_clear = dist_to_clear / max(vehicle.speed * 1.467 / 100, 0.01)
+                    remaining_yellow = max(0, signal.yellow_time - signal.phase_time)
+                    if time_to_clear > remaining_yellow and approaching_stop:
+                        return True
+                else:
+                    # Stopped vehicle should wait for green
+                    if approaching_stop:
+                        return True
+
+            # Green light - proceed
+            elif state == SignalState.GREEN:
+                return False
 
         elif signal.signal_type in (SignalType.STOP_SIGN, SignalType.FOUR_WAY_STOP, SignalType.FLASHING_RED):
-            # Must stop briefly, then proceed
-            if approaching_stop and vehicle.waiting_time < TrafficDefaults.STARTUP_LOST_TIME:
-                return True
+            # Stop signs: must come to complete stop for 2-3 seconds
+            stop_required_time = 2.5  # Seconds to wait at stop sign
+
+            if approaching_stop:
+                if not vehicle.has_completed_stop:
+                    if vehicle.speed < 0.5:
+                        # We're stopped, count the time
+                        vehicle.time_stopped_at_intersection += dt
+
+                        if vehicle.time_stopped_at_intersection >= stop_required_time:
+                            # We've waited long enough
+                            vehicle.has_completed_stop = True
+                            return False
+                    # Either moving or haven't waited long enough
+                    return True
+                else:
+                    # Already completed stop requirement
+                    return False
 
         elif signal.signal_type == SignalType.YIELD_SIGN:
-            # Yield if cross traffic present
-            pass
+            # Yield: slow down, check for cross traffic
+            cross_traffic = self._has_cross_traffic(vehicle, gx, gy)
+            if cross_traffic and approaching_stop:
+                return True
+
+        elif signal.signal_type == SignalType.FLASHING_YELLOW:
+            # Proceed with caution - no stop required
+            return False
 
         elif signal.signal_type == SignalType.ROUNDABOUT:
-            # Yield to traffic in roundabout
-            pass
+            # Yield to traffic already in roundabout
+            cross_traffic = self._has_cross_traffic(vehicle, gx, gy)
+            if cross_traffic and approaching_stop:
+                return True
 
-        # Pedestrian phase blocks all at stop line
+        # Pedestrian phase blocks all traffic
         if signal.pedestrian_phase and approaching_stop:
             return True
 
+        return False
+
+    def _has_cross_traffic(self, vehicle: Vehicle, gx: int, gy: int) -> bool:
+        """Check if there's cross traffic at an intersection."""
+        for other in self.vehicles:
+            if other is vehicle:
+                continue
+            other_gx, other_gy = int(other.x), int(other.y)
+            if other_gx == gx and other_gy == gy:
+                # Another vehicle is in the same intersection
+                # Check if it's cross traffic (perpendicular direction)
+                if vehicle.direction in (Direction.NORTH, Direction.SOUTH):
+                    if other.direction in (Direction.EAST, Direction.WEST):
+                        return True
+                else:
+                    if other.direction in (Direction.NORTH, Direction.SOUTH):
+                        return True
         return False
 
     def _get_vehicle_ahead(self, vehicle: Vehicle) -> Optional[Vehicle]:
@@ -2709,6 +2795,8 @@ class MapTracerWindow:
         self.drawing_mode = "road"  # road, intersection, signal
         self.traced_roads = []  # List of road segments
         self.current_road = []  # Current road being drawn
+        self.last_point = None  # Last point for straight line drawing
+        self.straight_line_mode = False  # For shift+click straight lines
 
         # API settings
         self.google_api_key = ""
@@ -2779,11 +2867,16 @@ class MapTracerWindow:
         self.canvas.bind("<MouseWheel>", self._on_scroll)
         self.canvas.bind("<Configure>", self._on_resize)
 
-        # Pan with middle mouse or shift+left
+        # Pan with middle mouse
         self.canvas.bind("<Button-2>", self._start_pan)
         self.canvas.bind("<B2-Motion>", self._do_pan)
-        self.canvas.bind("<Shift-Button-1>", self._start_pan)
-        self.canvas.bind("<Shift-B1-Motion>", self._do_pan)
+
+        # Shift+click for straight lines
+        self.canvas.bind("<Shift-Button-1>", self._on_shift_click)
+
+        # Control+drag for panning
+        self.canvas.bind("<Control-Button-1>", self._start_pan)
+        self.canvas.bind("<Control-B1-Motion>", self._do_pan)
 
         # Status bar
         status = ttk.Frame(self.window)
@@ -2803,11 +2896,19 @@ class MapTracerWindow:
         instructions.pack(fill=tk.X, padx=5, pady=5)
 
         ttk.Label(instructions, text=
-            "• Left-click and drag to draw roads\n"
-            "• Right-click to place intersections/signals\n"
-            "• Shift+drag or middle-mouse to pan the map\n"
-            "• Mouse wheel to zoom\n"
-            "• Click 'Apply to Grid' when done to transfer to simulator",
+            "DRAWING:\n"
+            "• Left-click and drag: Freehand draw roads along streets\n"
+            "• Shift+click: Draw straight line from last point (click twice for each line)\n"
+            "• Right-click: Place intersection marker (green dot)\n"
+            "\n"
+            "NAVIGATION:\n"
+            "• Ctrl+drag or middle-mouse: Pan the map\n"
+            "• Mouse wheel: Zoom in/out\n"
+            "\n"
+            "WORKFLOW:\n"
+            "1. Select 'Road' mode and trace major streets\n"
+            "2. Right-click where roads cross to mark intersections\n"
+            "3. Click 'Apply to Grid' to transfer layout to simulator",
             justify=tk.LEFT).pack(padx=10, pady=5)
 
         # Pan state
@@ -2961,26 +3062,34 @@ class MapTracerWindow:
                 return
 
             req = urllib.request.Request(url, headers={
-                'User-Agent': 'TrafficSimulator/1.0'
+                'User-Agent': 'TrafficSimulator/1.0 (Traffic Signal Simulation for Education)'
             })
-            with urllib.request.urlopen(req, timeout=5) as response:
+            with urllib.request.urlopen(req, timeout=10) as response:
                 image_data = response.read()
 
-            # Create PhotoImage from data (requires PIL for PNG, but we'll use a placeholder)
-            # For simplicity, we'll create a colored placeholder
-            # In production, you'd use PIL/Pillow to load the actual tile
-
-            # Create a simple colored tile as placeholder
-            tile_img = tk.PhotoImage(width=256, height=256)
-            # Create a simple pattern based on tile coords
-            color = f"#{(x*17) % 256:02x}{(y*23) % 256:02x}{((x+y)*7) % 256:02x}"
-            tile_img.put(color, to=(0, 0, 256, 256))
-
-            self.tile_images[tile_key] = tile_img
+            if PIL_AVAILABLE:
+                # Use PIL to load the actual tile image
+                pil_image = Image.open(io.BytesIO(image_data))
+                tile_img = ImageTk.PhotoImage(pil_image)
+                self.tile_images[tile_key] = tile_img
+            else:
+                # PIL not available - create placeholder with message
+                tile_img = tk.PhotoImage(width=256, height=256)
+                # Light gray background
+                tile_img.put("#cccccc", to=(0, 0, 256, 256))
+                self.tile_images[tile_key] = tile_img
+                # Show warning once
+                if not hasattr(self, '_pil_warning_shown'):
+                    self._pil_warning_shown = True
+                    self.status_label.config(
+                        text="Note: Install Pillow (pip install Pillow) for map tile display"
+                    )
 
         except Exception as e:
-            # Create error tile
-            pass
+            # Create error tile with X pattern
+            tile_img = tk.PhotoImage(width=256, height=256)
+            tile_img.put("#ffcccc", to=(0, 0, 256, 256))
+            self.tile_images[tile_key] = tile_img
 
     def _redraw_traced_roads(self):
         """Redraw all traced roads."""
@@ -3062,12 +3171,28 @@ class MapTracerWindow:
 
     def _on_click(self, event):
         """Handle click to start drawing."""
-        if event.state & 0x1:  # Shift key held - pan mode
+        if event.state & 0x4:  # Control key held - pan mode
             return
 
         self.is_drawing = True
         lat, lon = self._canvas_to_latlon(event.x, event.y)
         self.current_road = [(lat, lon)]
+        self.last_point = (lat, lon)
+
+    def _on_shift_click(self, event):
+        """Handle shift+click for straight line drawing."""
+        lat, lon = self._canvas_to_latlon(event.x, event.y)
+
+        if self.last_point is not None:
+            # Draw a straight line from last point to current click
+            self.traced_roads.append({
+                'type': self.draw_var.get(),
+                'points': [self.last_point, (lat, lon)]
+            })
+            self._redraw_traced_roads()
+
+        # Update last point for next straight line segment
+        self.last_point = (lat, lon)
 
     def _on_drag(self, event):
         """Handle drag to continue drawing."""
