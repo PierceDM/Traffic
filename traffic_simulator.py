@@ -1595,18 +1595,15 @@ class TrafficSimulator:
             (signal.all_red_time, {d: SignalState.RED for d in Direction}),
         ]
 
-        # Handle pedestrian phase in tourism areas
-        if signal.is_tourism_area and self.ped_var.get():
-            # Add pedestrian delay randomly
-            if random.random() < 0.01 * self.tourism_var.get():
-                signal.pedestrian_phase = True
-                signal.pedestrian_time_remaining = TrafficDefaults.PEDESTRIAN_WALK_TIME + \
-                                                   TrafficDefaults.PEDESTRIAN_CLEARANCE
-
+        # Handle active pedestrian phase first
         if signal.pedestrian_phase:
             signal.pedestrian_time_remaining -= dt
             if signal.pedestrian_time_remaining <= 0:
                 signal.pedestrian_phase = False
+                # Ensure we track when ped phase ended
+                if not hasattr(signal, 'last_ped_phase_time'):
+                    signal.last_ped_phase_time = 0
+                signal.last_ped_phase_time = 0  # Reset cycle counter
             # All directions red during pedestrian phase
             for d in Direction:
                 signal.states[d] = SignalState.RED
@@ -1617,7 +1614,25 @@ class TrafficSimulator:
 
         if signal.phase_time >= current_phase_duration:
             signal.phase_time = 0
+            old_phase = signal.current_phase
             signal.current_phase = (signal.current_phase + 1) % len(phases)
+
+            # Tourism pedestrian phase: trigger at end of full cycle (phase 5 -> 0)
+            # Only if pedestrians enabled and tourism area, with cooldown
+            if signal.is_tourism_area and self.ped_var.get():
+                if not hasattr(signal, 'last_ped_phase_time'):
+                    signal.last_ped_phase_time = 0
+                signal.last_ped_phase_time += current_phase_duration
+
+                # Trigger pedestrian phase at end of cycle (every ~60-90 seconds)
+                # Higher tourism rate = more frequent pedestrian phases
+                min_interval = 60.0 / self.tourism_var.get()  # Higher rate = shorter interval
+                if old_phase == 5 and signal.last_ped_phase_time >= min_interval:
+                    if random.random() < 0.5:  # 50% chance at cycle end
+                        signal.pedestrian_phase = True
+                        signal.pedestrian_time_remaining = TrafficDefaults.PEDESTRIAN_WALK_TIME + \
+                                                           TrafficDefaults.PEDESTRIAN_CLEARANCE
+                        signal.last_ped_phase_time = 0
 
         signal.states.update(phases[signal.current_phase][1])
 
@@ -1692,10 +1707,30 @@ class TrafficSimulator:
             # Determine target speed based on conditions
             base_target = vehicle.target_speed * speed_mod
 
-            # Check for signals
+            # Check for signals - look at current cell AND the cell ahead
             should_stop = False
+
+            # Check current cell for signal
             if cell.signal:
                 should_stop = self._should_vehicle_stop(vehicle, cell.signal, dt)
+
+            # Also check cell ahead for upcoming signals
+            if not should_stop:
+                ahead_gx, ahead_gy = gx, gy
+                if vehicle.direction == Direction.NORTH:
+                    ahead_gy = gy - 1
+                elif vehicle.direction == Direction.SOUTH:
+                    ahead_gy = gy + 1
+                elif vehicle.direction == Direction.EAST:
+                    ahead_gx = gx + 1
+                elif vehicle.direction == Direction.WEST:
+                    ahead_gx = gx - 1
+
+                if 0 <= ahead_gx < self.grid_size and 0 <= ahead_gy < self.grid_size:
+                    ahead_cell = self.grid[ahead_gy][ahead_gx]
+                    if ahead_cell.signal:
+                        # Check if we need to stop for the upcoming signal
+                        should_stop = self._should_vehicle_stop_ahead(vehicle, ahead_cell.signal)
 
             # Check for vehicles ahead
             vehicle_ahead = self._get_vehicle_ahead(vehicle)
@@ -1769,26 +1804,31 @@ class TrafficSimulator:
         in_intersection = (0.35 < cell_x < 0.65 and 0.35 < cell_y < 0.65)
 
         # Check if approaching stop line (depends on direction)
-        # Stop line is about 0.3-0.4 from the edge vehicle is entering from
+        # Stop line is at the edge of the intersection area
+        # Vehicles should stop before entering the central area (0.35-0.65)
         approaching_stop = False
         past_stop_line = False
 
         if vehicle.direction == Direction.NORTH:
-            # Entering from bottom, stop line at y ~0.7
-            approaching_stop = 0.55 < cell_y < 0.85
-            past_stop_line = cell_y <= 0.55
+            # Entering from bottom (high y), moving toward low y
+            # Stop line at y ~0.65 (before intersection center)
+            approaching_stop = cell_y >= 0.60  # At or approaching from bottom
+            past_stop_line = cell_y < 0.60
         elif vehicle.direction == Direction.SOUTH:
-            # Entering from top, stop line at y ~0.3
-            approaching_stop = 0.15 < cell_y < 0.45
-            past_stop_line = cell_y >= 0.45
+            # Entering from top (low y), moving toward high y
+            # Stop line at y ~0.35
+            approaching_stop = cell_y <= 0.40  # At or approaching from top
+            past_stop_line = cell_y > 0.40
         elif vehicle.direction == Direction.EAST:
-            # Entering from left, stop line at x ~0.3
-            approaching_stop = 0.15 < cell_x < 0.45
-            past_stop_line = cell_x >= 0.45
+            # Entering from left (low x), moving toward high x
+            # Stop line at x ~0.35
+            approaching_stop = cell_x <= 0.40  # At or approaching from left
+            past_stop_line = cell_x > 0.40
         elif vehicle.direction == Direction.WEST:
-            # Entering from right, stop line at x ~0.7
-            approaching_stop = 0.55 < cell_x < 0.85
-            past_stop_line = cell_x <= 0.55
+            # Entering from right (high x), moving toward low x
+            # Stop line at x ~0.65
+            approaching_stop = cell_x >= 0.60  # At or approaching from right
+            past_stop_line = cell_x < 0.60
 
         # Track intersection changes - reset stop state when entering new intersection
         if vehicle.last_stop_intersection != current_intersection:
@@ -1796,8 +1836,9 @@ class TrafficSimulator:
             vehicle.time_stopped_at_intersection = 0.0
             vehicle.has_completed_stop = False
 
-        # If past the stop line and in intersection, keep moving to clear it
-        if past_stop_line and vehicle.speed > 2:
+        # If already well into the intersection (past the center), keep moving to clear it
+        # This prevents vehicles from stopping in the middle of an intersection
+        if in_intersection and vehicle.speed > 5:
             return False
 
         # Handle different signal types
@@ -1805,8 +1846,11 @@ class TrafficSimulator:
             state = signal.states.get(vehicle.direction, SignalState.RED)
 
             if state == SignalState.RED:
-                # Must stop at red light
-                if approaching_stop or (not past_stop_line and vehicle.speed < 3):
+                # Must stop at red light - if at or before stop line, stop
+                if approaching_stop:
+                    return True
+                # If we're past the stop line but not in intersection center, still stop
+                if not in_intersection:
                     return True
 
             elif state == SignalState.YELLOW:
@@ -1884,6 +1928,35 @@ class TrafficSimulator:
                 else:
                     if other.direction in (Direction.NORTH, Direction.SOUTH):
                         return True
+        return False
+
+    def _should_vehicle_stop_ahead(self, vehicle: Vehicle, signal: TrafficSignal) -> bool:
+        """Check if vehicle should slow/stop for a signal in the NEXT cell (looking ahead)."""
+        # This is for upcoming signals - we want to start slowing down before we reach them
+
+        if signal.signal_type == SignalType.TRAFFIC_LIGHT:
+            state = signal.states.get(vehicle.direction, SignalState.RED)
+            if state == SignalState.RED:
+                # Red light ahead - slow down and prepare to stop
+                return True
+            elif state == SignalState.YELLOW:
+                # Yellow light ahead - be cautious
+                return True
+
+        elif signal.signal_type in (SignalType.STOP_SIGN, SignalType.FOUR_WAY_STOP, SignalType.FLASHING_RED):
+            # Stop sign ahead - slow down to prepare
+            if vehicle.speed > 15:  # If going faster than 15 mph, start slowing
+                return True
+
+        elif signal.signal_type == SignalType.YIELD_SIGN:
+            # Yield ahead - slow down
+            if vehicle.speed > 20:
+                return True
+
+        # Pedestrian phase blocks all traffic
+        if signal.pedestrian_phase:
+            return True
+
         return False
 
     def _get_vehicle_ahead(self, vehicle: Vehicle) -> Optional[Vehicle]:
